@@ -1,0 +1,74 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url("https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@400;500;700&display=swap");
+
+html,
+body {
+  background: #0a0e14;
+  color: #d6dde6;
+  font-family: "Space Grotesk", system-ui, sans-serif;
+}
+
+.font-mono {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+}
+
+.panel {
+  background: #0f141b;
+  border: 1px solid #1c232e;
+  border-radius: 8px;
+}
+
+.label {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #5b6675;
+}
+
+.input {
+  width: 100%;
+  background: #0a0e14;
+  border: 1px solid #1c232e;
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-family: "JetBrains Mono", monospace;
+  color: #d6dde6;
+  font-size: 13px;
+}
+.input:focus {
+  outline: none;
+  border-color: #d4ff3a;
+}
+
+.btn {
+  padding: 10px 16px;
+  border-radius: 6px;
+  font-weight: 600;
+  font-size: 13px;
+  letter-spacing: 0.02em;
+  transition: all 120ms ease;
+  cursor: pointer;
+}
+.btn-primary {
+  background: #d4ff3a;
+  color: #0a0e14;
+}
+.btn-primary:hover {
+  background: #b8e030;
+}
+.btn-danger {
+  background: #ff5266;
+  color: white;
+}
+.btn-ghost {
+  background: transparent;
+  color: #d6dde6;
+  border: 1px solid #1c232e;
+}
+.btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}

@@ -16,7 +16,7 @@ use crate::models::{
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use dashmap::DashMap;
-use ethers::signers::LocalWallet;
+use ethers::signers::{LocalWallet, Signer};
 use hyperliquid_rust_sdk::{
     BaseUrl, ClientCancelRequest, ClientLimit, ClientOrder, ClientOrderRequest, ExchangeClient,
     ExchangeDataStatus, ExchangeResponseStatus, InfoClient,
@@ -83,7 +83,7 @@ impl Exchange for HyperliquidClient {
         match self.info.l2_snapshot(self.coin.clone()).await {
             Ok(snap) => {
                 // snap.levels is [bids, asks], each a Vec of BookLevel { px, sz, n }.
-                let parse = |levels: &Vec<hyperliquid_rust_sdk::BookLevel>| -> Vec<OrderBookLevel> {
+                let parse = |levels: &Vec<hyperliquid_rust_sdk::Level>| -> Vec<OrderBookLevel> {
                     levels
                         .iter()
                         .take(10)
@@ -240,6 +240,9 @@ impl Exchange for HyperliquidClient {
             side,
             price: avg,
             qty: filled,
+            // No fee data in the immediate place_order response; the user_fills
+            // poll in tick() will record fee'd duplicates if any.
+            fee: 0.0,
             timestamp: chrono::Utc::now().timestamp_millis(),
         };
         let _ = self.fills_tx.send(fill);
@@ -286,7 +289,7 @@ impl Exchange for HyperliquidClient {
         // Poll user fills since last_seen_fill.
         let user = self.exch.wallet.address();
         let since = *self.last_seen_fill.read();
-        let fills_res = self.info.user_fills_by_time(user, since, None).await;
+        let fills_res = self.info.user_fills(user).await;
         let fills = match fills_res {
             Ok(f) => f,
             Err(_) => return,
@@ -302,6 +305,7 @@ impl Exchange for HyperliquidClient {
             if let Some(our) = our_order {
                 let price = f.px.parse::<f64>().unwrap_or(our.price);
                 let qty = f.sz.parse::<f64>().unwrap_or(our.qty);
+                let fee = f.fee.parse::<f64>().unwrap_or(0.0).abs();
                 let fill = Fill {
                     fill_id: Uuid::new_v4(),
                     order_id: our.order_id,
@@ -310,6 +314,7 @@ impl Exchange for HyperliquidClient {
                     side: our.side,
                     price,
                     qty,
+                    fee,
                     timestamp: f.time as i64,
                 };
                 let _ = self.fills_tx.send(fill);

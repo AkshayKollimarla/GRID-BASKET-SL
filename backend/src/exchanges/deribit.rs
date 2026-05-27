@@ -18,13 +18,25 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use reqwest::Client as HttpClient;
-use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 use tracing::{debug, warn};
 use uuid::Uuid;
+
+/// Per-instrument minimum/increment ($) for Deribit's `amount` field.
+/// BTC-PERPETUAL: $10 contract size. ETH-PERPETUAL: $1. Fallback $1.
+fn deribit_contract_size(instrument: &str) -> f64 {
+    let inst = instrument.to_ascii_uppercase();
+    if inst.starts_with("BTC-") {
+        10.0
+    } else if inst.starts_with("ETH-") {
+        1.0
+    } else {
+        1.0
+    }
+}
 
 pub struct DeribitClient {
     http: HttpClient,
@@ -40,15 +52,10 @@ pub struct DeribitClient {
     basket_orders: Arc<DashMap<Uuid, Vec<String>>>,
 }
 
-#[derive(Debug, Deserialize)]
-struct AuthResp {
-    result: AuthResult,
-}
-#[derive(Debug, Deserialize)]
-struct AuthResult {
-    access_token: String,
-    expires_in: u64,
-}
+// AuthResp / AuthResult were removed in favor of tolerant Value-based parsing
+// in ensure_token(). The previous strict types caused a confusing
+// "missing field `result`" error whenever Deribit returned an error response
+// (e.g. invalid credentials, IP block, key on the wrong env).
 
 impl DeribitClient {
     pub fn new(
@@ -87,7 +94,10 @@ impl DeribitClient {
             }
         }
         let url = format!("{}/public/auth", self.base_url);
-        let resp = self
+        // Parse as untyped Value so we can surface the real Deribit error
+        // message (e.g. "invalid_credentials") instead of getting a confusing
+        // "missing field `result`" deserialization error.
+        let resp: Value = self
             .http
             .get(&url)
             .query(&[
@@ -97,11 +107,23 @@ impl DeribitClient {
             ])
             .send()
             .await?
-            .json::<AuthResp>()
+            .json()
             .await?;
-        let exp = Instant::now() + Duration::from_secs(resp.result.expires_in.saturating_sub(30));
-        *self.token.write() = Some((resp.result.access_token.clone(), exp));
-        Ok(resp.result.access_token)
+        if let Some(err) = resp.get("error") {
+            return Err(anyhow!(
+                "Deribit auth failed ({}): {}",
+                self.base_url,
+                err
+            ));
+        }
+        let access_token = resp["result"]["access_token"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Deribit auth: missing access_token in response: {}", resp))?
+            .to_string();
+        let expires_in = resp["result"]["expires_in"].as_u64().unwrap_or(900);
+        let exp = Instant::now() + Duration::from_secs(expires_in.saturating_sub(30));
+        *self.token.write() = Some((access_token.clone(), exp));
+        Ok(access_token)
     }
 
     async fn private_call(&self, endpoint: &str, params: Value) -> Result<Value> {
@@ -212,12 +234,21 @@ impl Exchange for DeribitClient {
             MySide::Buy => "private/buy",
             MySide::Sell => "private/sell",
         };
+        // Deribit BTC-PERPETUAL min order is $10 in $10 increments; ETH-PERP
+        // is $1 in $1 increments. Round down to the contract size, clamp to
+        // the minimum, so the API accepts the order.
+        let contract_size = deribit_contract_size(&self.instrument);
+        let qty_rounded = {
+            let n = (qty / contract_size).floor();
+            let rounded = n * contract_size;
+            rounded.max(contract_size)
+        };
         let resp = self
             .private_call(
                 endpoint,
                 json!({
                     "instrument_name": self.instrument,
-                    "amount": qty,
+                    "amount": qty_rounded,
                     "type": "limit",
                     "price": price,
                     "post_only": true,
@@ -272,12 +303,20 @@ impl Exchange for DeribitClient {
             MySide::Buy => "private/buy",
             MySide::Sell => "private/sell",
         };
+        // Same rounding rule as maker orders — Deribit requires whole multiples
+        // of the contract size.
+        let contract_size = deribit_contract_size(&self.instrument);
+        let qty_rounded = {
+            let n = (qty / contract_size).floor();
+            let rounded = n * contract_size;
+            rounded.max(contract_size)
+        };
         let resp = self
             .private_call(
                 endpoint,
                 json!({
                     "instrument_name": self.instrument,
-                    "amount": qty,
+                    "amount": qty_rounded,
                     "type": "market",
                     "reduce_only": true,
                 }),
@@ -310,6 +349,9 @@ impl Exchange for DeribitClient {
             side,
             price: avg_price,
             qty: filled,
+            // Fee not returned on this synchronous response; tick() will pick
+            // up the authoritative fee from the user-trades feed shortly.
+            fee: 0.0,
             timestamp: chrono::Utc::now().timestamp_millis(),
         };
         let _ = self.fills_tx.send(fill);
@@ -392,6 +434,9 @@ impl Exchange for DeribitClient {
             };
             let price = t["price"].as_f64().unwrap_or(our_order.price);
             let qty = t["amount"].as_f64().unwrap_or(our_order.qty);
+            // Deribit returns "fee" in quote currency (USD for inverse perps it's
+            // actually in base, but we treat it as a magnitude for accounting).
+            let fee = t["fee"].as_f64().unwrap_or(0.0).abs();
             let fill = Fill {
                 fill_id: Uuid::new_v4(),
                 order_id: our_order.order_id,
@@ -400,6 +445,7 @@ impl Exchange for DeribitClient {
                 side: our_order.side,
                 price,
                 qty,
+                fee,
                 timestamp: chrono::Utc::now().timestamp_millis(),
             };
             let _ = self.fills_tx.send(fill);

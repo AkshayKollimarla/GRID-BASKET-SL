@@ -13,12 +13,36 @@ pub enum Exchange {
 pub struct TradingConfig {
     pub token: String,
     pub exchange: Exchange,
+    /// Mock-only seed price + legacy fallback for absolute bounds when
+    /// `grid_distance` isn't usable (no live mid). Not shown in the UI.
+    #[serde(default)]
     pub grid_lower: f64,
+    #[serde(default)]
     pub grid_upper: f64,
+    /// Distance (in price units) from the initial mid that defines the
+    /// ABSOLUTE hard cap on both sides. At engine start the bot reads the
+    /// first live mid M and sets absolute_lower = M − distance,
+    /// absolute_upper = M + distance. If price ever escapes that envelope
+    /// the kill switch trips permanently.
+    #[serde(default = "default_grid_distance")]
+    pub grid_distance: f64,
+    /// Spacing between grid levels (in price units).  UI label: "Average".
     pub grid_step: f64,
+    /// Trailing depth: how many BUY levels below mid AND how many SELL
+    /// levels above mid the grid maintains at any time. Cycle SL triggers
+    /// fire at anchor ± (depth+1) × step.
+    #[serde(default = "default_grid_depth")]
+    pub grid_depth: u32,
     pub per_step_qty: f64,
     pub tp_spread: f64,
     pub maker_only: bool,
+}
+
+fn default_grid_depth() -> u32 {
+    5
+}
+fn default_grid_distance() -> f64 {
+    2_000.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +63,15 @@ pub struct KillSwitchConfig {
     pub max_position_cap: f64,
     pub max_daily_loss: f64,
     pub api_disconnect_protection: bool,
+    /// Max number of soft boundary-SL cycle resets allowed before the bot
+    /// permanently stops. Each "basket hit" = price escaped the cycle window
+    /// (anchor ± (depth+1)·step), positions flattened, grid recentered.
+    #[serde(default = "default_max_basket_hits")]
+    pub max_basket_hits: u32,
+}
+
+fn default_max_basket_hits() -> u32 {
+    5
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,9 +99,11 @@ impl AgentConfig {
             trading: TradingConfig {
                 token: "BTC-USDT".into(),
                 exchange: Exchange::Mock,
-                grid_lower: 60_000.0,
-                grid_upper: 70_000.0,
+                grid_lower: 60_000.0, // mock seed only
+                grid_upper: 70_000.0, // mock seed only
+                grid_distance: 5_000.0,
                 grid_step: 200.0,
+                grid_depth: 5,
                 per_step_qty: 0.01,
                 tp_spread: 150.0,
                 maker_only: true,
@@ -82,6 +117,7 @@ impl AgentConfig {
                 max_position_cap: 0.5,
                 max_daily_loss: 500.0,
                 api_disconnect_protection: true,
+                max_basket_hits: 5,
             },
             slicing: EmergencySlicingConfig {
                 enabled: true,

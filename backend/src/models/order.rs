@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum Side {
     Buy,
@@ -72,5 +72,9 @@ pub struct Fill {
     pub side: Side,
     pub price: f64,
     pub qty: f64,
+    /// Exchange fee paid in quote currency (USD-ish). Always non-negative.
+    /// 0.0 if the exchange didn't return fee data (e.g. immediate market exits).
+    #[serde(default)]
+    pub fee: f64,
     pub timestamp: i64,
 }

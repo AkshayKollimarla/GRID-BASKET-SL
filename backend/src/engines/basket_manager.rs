@@ -1,4 +1,4 @@
-use crate::models::{Basket, BasketConfig, BasketStatus};
+use crate::models::{Basket, BasketConfig, BasketSide, BasketStatus};
 use dashmap::DashMap;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -10,10 +10,24 @@ pub struct BasketManager {
 }
 
 impl BasketManager {
-    pub fn new(config: BasketConfig) -> Self {
+    pub fn new(config: BasketConfig, is_inverse: bool) -> Self {
         let baskets = Arc::new(DashMap::new());
-        for i in 0..config.num_baskets {
-            let b = Basket::new(i, config.basket_size_qty, config.basket_sl_distance);
+        // Split half long, half short. Odd count → one extra long.
+        let n = config.num_baskets;
+        let long_count = (n + 1) / 2;
+        for i in 0..n {
+            let side = if i < long_count {
+                BasketSide::Long
+            } else {
+                BasketSide::Short
+            };
+            let b = Basket::new(
+                i,
+                side,
+                config.basket_size_qty,
+                config.basket_sl_distance,
+                is_inverse,
+            );
             baskets.insert(b.basket_id, b);
         }
         Self {
@@ -51,6 +65,28 @@ impl BasketManager {
             .filter_map(|e| {
                 let b = e.value();
                 if b.has_capacity(qty) {
+                    Some((b.index, b.basket_id))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        candidates.sort_by_key(|(i, _)| *i);
+        candidates.first().map(|(_, id)| *id)
+    }
+
+    /// Find the first non-killed basket of the requested side with capacity.
+    pub fn find_basket_with_capacity_by_side(
+        &self,
+        side: BasketSide,
+        qty: f64,
+    ) -> Option<Uuid> {
+        let mut candidates: Vec<(u32, Uuid)> = self
+            .baskets
+            .iter()
+            .filter_map(|e| {
+                let b = e.value();
+                if b.side == side && b.has_capacity(qty) {
                     Some((b.index, b.basket_id))
                 } else {
                     None

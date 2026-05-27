@@ -1,9 +1,12 @@
 "use client";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   AgentConfig,
+  RoundTrip,
   Snapshot,
+  TradeStats,
   getDefaultConfig,
+  getInstruments,
   startEngine,
   stopEngine,
   killSwitch,
@@ -11,6 +14,9 @@ import {
   getSnapshot,
 } from "@/lib/api";
 
+/* ===================================================================
+   ROOT
+   =================================================================== */
 export default function Home() {
   const [cfg, setCfg] = useState<AgentConfig | null>(null);
   const [snap, setSnap] = useState<Snapshot | null>(null);
@@ -38,51 +44,99 @@ export default function Home() {
   if (!cfg) return <Loading />;
 
   return (
-    <main className="min-h-screen p-6">
-      <Header snap={snap} />
-      <div className="grid grid-cols-1 lg:grid-cols-[420px_1fr] gap-6 mt-6">
-        <ConfigPanel cfg={cfg} setCfg={setCfg} snap={snap} />
-        <Dashboard snap={snap} />
+    <main className="min-h-screen">
+      <TopBar cfg={cfg} snap={snap} />
+      <div className="px-6 pb-8 max-w-7xl mx-auto">
+        <AccordionStack cfg={cfg} setCfg={setCfg} snap={snap} />
       </div>
     </main>
   );
 }
 
-function Header({ snap }: { snap: Snapshot | null }) {
+/* ===================================================================
+   TOP BAR — status, mid price, action buttons
+   =================================================================== */
+function TopBar({ cfg, snap }: { cfg: AgentConfig; snap: Snapshot | null }) {
   const running = snap?.running ?? false;
   const tripped = snap?.kill_switch_tripped ?? false;
   return (
-    <header className="flex items-center justify-between">
-      <div>
-        <h1 className="text-3xl font-display font-bold tracking-tight">
-          BASKET<span className="text-accent">.</span>GRID
-        </h1>
-        <p className="text-muted text-xs uppercase tracking-widest mt-1">
-          Maker-Only Basket Grid Engine — Paper Mode
-        </p>
+    <div className="px-6 py-4 border-b border-edge bg-white">
+      <div className="flex items-center justify-between gap-4 flex-wrap">
+        <div>
+          <h1>Active Agent</h1>
+          <p className="text-muted text-xs mt-1">
+            {snap?.exchange_name ?? "—"} · {cfg.trading.token}
+          </p>
+        </div>
+        <div className="flex items-center gap-3">
+          <StatusPill
+            label={tripped ? "KILLED" : running ? "RUNNING" : "IDLE"}
+            color={tripped ? "danger" : running ? "good" : "muted"}
+          />
+          {snap && snap.cycle_anchor > 0 && (
+            <div className="hidden lg:flex flex-col items-end text-[11px] font-mono leading-tight">
+              <span className="text-muted">
+                anchor <span className="text-ink font-bold">{snap.cycle_anchor.toFixed(2)}</span>
+              </span>
+              <span className="text-muted">
+                <span className="text-danger">{snap.cycle_lower.toFixed(2)}</span>
+                {" ↔ "}
+                <span className="text-danger">{snap.cycle_upper.toFixed(2)}</span>
+              </span>
+              <span className="text-muted">
+                hits{" "}
+                <span className="text-ink font-bold">
+                  {snap.basket_hits}/{snap.max_basket_hits}
+                </span>
+              </span>
+            </div>
+          )}
+          {snap && (
+            <div className="font-mono text-xl font-bold tabular-nums">
+              {snap.mid_price.toFixed(2)}
+              <span className="text-muted text-xs font-normal ml-2">mid</span>
+            </div>
+          )}
+          <button
+            className="btn btn-primary"
+            disabled={running}
+            onClick={() => startEngine(cfg)}
+          >
+            ▶ Start
+          </button>
+          <button
+            className="btn btn-ghost"
+            disabled={!running}
+            onClick={stopEngine}
+          >
+            ■ Stop
+          </button>
+          <button
+            className="btn btn-danger"
+            disabled={!running || tripped}
+            onClick={killSwitch}
+          >
+            ⚠ Kill
+          </button>
+          <button
+            className="btn btn-ghost"
+            disabled={!tripped}
+            onClick={resetKillSwitch}
+          >
+            Reset
+          </button>
+        </div>
       </div>
-      <div className="flex items-center gap-3">
-        <StatusPill
-          label={tripped ? "KILLED" : running ? "RUNNING" : "IDLE"}
-          color={tripped ? "danger" : running ? "good" : "muted"}
-        />
-        {snap && (
-          <div className="font-mono text-xl">
-            {snap.mid_price.toFixed(2)}
-            <span className="text-muted text-xs ml-2">mid</span>
-          </div>
-        )}
-      </div>
-    </header>
+    </div>
   );
 }
 
 function StatusPill({ label, color }: { label: string; color: string }) {
   const colorMap: Record<string, string> = {
-    good: "bg-good text-ink",
+    good: "bg-good text-white",
     danger: "bg-danger text-white",
-    warn: "bg-warn text-ink",
-    muted: "bg-edge text-muted",
+    warn: "bg-warn text-white",
+    muted: "bg-slate-200 text-slate-600",
   };
   return (
     <span
@@ -93,26 +147,20 @@ function StatusPill({ label, color }: { label: string; color: string }) {
   );
 }
 
-function Loading() {
-  return (
-    <div className="min-h-screen flex items-center justify-center text-muted">
-      Loading…
-    </div>
-  );
-}
-function ErrorBox({ msg }: { msg: string }) {
-  return (
-    <div className="min-h-screen flex items-center justify-center p-6">
-      <div className="panel p-6 max-w-lg">
-        <div className="text-danger font-bold mb-2">Backend unreachable</div>
-        <div className="text-sm text-muted">{msg}</div>
-      </div>
-    </div>
-  );
-}
+/* ===================================================================
+   ACCORDION STACK
+   =================================================================== */
+type SectionKey =
+  | "inputs"
+  | "book"
+  | "orders"
+  | "summary"
+  | "history"
+  | "rtps"
+  | "baskets"
+  | "risk";
 
-/* ---------- Config Panel ---------- */
-function ConfigPanel({
+function AccordionStack({
   cfg,
   setCfg,
   snap,
@@ -121,9 +169,200 @@ function ConfigPanel({
   setCfg: (c: AgentConfig) => void;
   snap: Snapshot | null;
 }) {
-  const running = snap?.running ?? false;
-  const tripped = snap?.kill_switch_tripped ?? false;
+  const [openMap, setOpenMap] = useState<Record<SectionKey, boolean>>({
+    inputs: false,
+    book: false,
+    orders: false,
+    summary: true,
+    history: false,
+    rtps: false,
+    baskets: false,
+    risk: false,
+  });
+  const toggle = (k: SectionKey) =>
+    setOpenMap((m) => ({ ...m, [k]: !m[k] }));
+  const allOpen = Object.values(openMap).every(Boolean);
+  const expandAll = () =>
+    setOpenMap((m) => {
+      const flip = !allOpen;
+      return Object.fromEntries(
+        Object.keys(m).map((k) => [k, flip])
+      ) as Record<SectionKey, boolean>;
+    });
 
+  return (
+    <div className="pt-4 space-y-3">
+      <div className="flex justify-end">
+        <button className="btn btn-ghost text-xs" onClick={expandAll}>
+          {allOpen ? "▴ Collapse All" : "▾ Expand All"}
+        </button>
+      </div>
+
+      <Accordion
+        title="Agent Inputs"
+        icon="≡"
+        iconBg="bg-violet-100"
+        iconColor="text-violet-600"
+        isOpen={openMap.inputs}
+        onToggle={() => toggle("inputs")}
+      >
+        <ConfigPanel cfg={cfg} setCfg={setCfg} />
+      </Accordion>
+
+      <Accordion
+        title="Baskets"
+        icon="◫"
+        iconBg="bg-blue-100"
+        iconColor="text-blue-600"
+        isOpen={openMap.baskets}
+        onToggle={() => toggle("baskets")}
+        rightExtra={
+          snap
+            ? `${snap.baskets.filter((b) => b.status !== "IDLE").length}/${
+                snap.baskets.length
+              } active`
+            : undefined
+        }
+      >
+        <BasketGrid snap={snap} />
+      </Accordion>
+
+      <Accordion
+        title="Live Order Book"
+        icon="≋"
+        iconBg="bg-emerald-100"
+        iconColor="text-emerald-600"
+        isOpen={openMap.book}
+        onToggle={() => toggle("book")}
+        rightExtra={
+          <span className="text-emerald-600 text-xs font-semibold">
+            ● Live
+          </span>
+        }
+      >
+        <LiveOrderBook snap={snap} />
+      </Accordion>
+
+      <Accordion
+        title="Open Orders"
+        icon="≡"
+        iconBg="bg-amber-100"
+        iconColor="text-amber-600"
+        isOpen={openMap.orders}
+        onToggle={() => toggle("orders")}
+        rightExtra={snap ? `${snap.open_orders.length}` : undefined}
+      >
+        <OpenOrders snap={snap} />
+      </Accordion>
+
+      <Accordion
+        title="Trade Summary"
+        icon="▤"
+        iconBg="bg-emerald-100"
+        iconColor="text-emerald-600"
+        isOpen={openMap.summary}
+        onToggle={() => toggle("summary")}
+      >
+        <TradeSummary snap={snap} />
+      </Accordion>
+
+      <Accordion
+        title="Trade History"
+        icon="◷"
+        iconBg="bg-violet-100"
+        iconColor="text-violet-600"
+        isOpen={openMap.history}
+        onToggle={() => toggle("history")}
+        rightExtra={
+          snap ? `${snap.recent_fills.length} fills` : undefined
+        }
+      >
+        <TradeHistory snap={snap} />
+      </Accordion>
+
+      <Accordion
+        title="Round Trips"
+        icon="↻"
+        iconBg="bg-emerald-100"
+        iconColor="text-emerald-600"
+        isOpen={openMap.rtps}
+        onToggle={() => toggle("rtps")}
+        rightExtra={
+          snap
+            ? `${snap.trade_stats.round_trips} TP · ${snap.trade_stats.sl_count} SL`
+            : undefined
+        }
+      >
+        <RoundTripsPanel snap={snap} />
+      </Accordion>
+
+      <Accordion
+        title="Risk & Log"
+        icon="⚐"
+        iconBg="bg-rose-100"
+        iconColor="text-rose-600"
+        isOpen={openMap.risk}
+        onToggle={() => toggle("risk")}
+      >
+        <RiskAndLog snap={snap} />
+      </Accordion>
+    </div>
+  );
+}
+
+function Accordion({
+  title,
+  icon,
+  iconBg,
+  iconColor,
+  isOpen,
+  onToggle,
+  rightExtra,
+  children,
+}: {
+  title: string;
+  icon: string;
+  iconBg: string;
+  iconColor: string;
+  isOpen: boolean;
+  onToggle: () => void;
+  rightExtra?: React.ReactNode;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="panel overflow-hidden">
+      <button
+        onClick={onToggle}
+        className="w-full flex items-center gap-3 px-5 py-4 text-left hover:bg-slate-50 transition"
+      >
+        <div
+          className={`w-8 h-8 rounded-md grid place-items-center ${iconBg} ${iconColor} text-base font-bold`}
+        >
+          {icon}
+        </div>
+        <h2 className="flex-1">{title}</h2>
+        {rightExtra && (
+          <span className="text-xs text-muted font-semibold mr-2">
+            {rightExtra}
+          </span>
+        )}
+        <span className="text-muted text-sm">{isOpen ? "▴" : "▾"}</span>
+      </button>
+      {isOpen && <div className="px-5 pb-5 pt-1 border-t border-edge">{children}</div>}
+    </div>
+  );
+}
+
+/* ===================================================================
+   AGENT INPUTS
+   =================================================================== */
+function ConfigPanel({
+  cfg,
+  setCfg,
+}: {
+  cfg: AgentConfig;
+  setCfg: (c: AgentConfig) => void;
+}) {
   const update = <K extends keyof AgentConfig>(
     section: K,
     field: keyof AgentConfig[K],
@@ -135,47 +374,88 @@ function ConfigPanel({
     });
   };
 
+  // Live-fetched symbols for the selected exchange.
+  const [symbols, setSymbols] = useState<string[]>([]);
+  const [loadingSymbols, setLoadingSymbols] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    setLoadingSymbols(true);
+    setSymbols([]);
+    getInstruments(cfg.trading.exchange).then((s) => {
+      if (cancelled) return;
+      setSymbols(s);
+      setLoadingSymbols(false);
+      // If the current token isn't in the new list, default to the first one.
+      if (s.length > 0 && !s.includes(cfg.trading.token)) {
+        update("trading", "token", s[0]);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cfg.trading.exchange]);
+
   return (
-    <div className="panel p-5 space-y-5 h-fit">
+    <div className="space-y-5 pt-4">
       <Section title="Trading">
-        <Field label="Token">
-          <input
-            className="input"
-            value={cfg.trading.token}
-            onChange={(e) => update("trading", "token", e.target.value)}
-          />
-        </Field>
-        <Field label="Exchange">
-          <select
-            className="input"
-            value={cfg.trading.exchange}
-            onChange={(e) =>
-              update("trading", "exchange", e.target.value as any)
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Exchange">
+            <select
+              className="input"
+              value={cfg.trading.exchange}
+              onChange={(e) =>
+                update("trading", "exchange", e.target.value as any)
+              }
+            >
+              <option value="mock">Mock (paper)</option>
+              <option value="deribit">Deribit</option>
+              <option value="hyperliquid">Hyperliquid</option>
+            </select>
+          </Field>
+          <Field
+            label={
+              loadingSymbols
+                ? "Symbol (loading…)"
+                : `Symbol (${symbols.length} available)`
             }
           >
-            <option value="mock">Mock (paper)</option>
-            <option value="binance">Binance</option>
-            <option value="deribit">Deribit</option>
-            <option value="hyperliquid">Hyperliquid</option>
-          </select>
-        </Field>
-        <div className="grid grid-cols-2 gap-3">
-          <Field label="Grid lower">
+            <select
+              className="input"
+              value={cfg.trading.token}
+              disabled={loadingSymbols || symbols.length === 0}
+              onChange={(e) => update("trading", "token", e.target.value)}
+            >
+              {symbols.length === 0 && (
+                <option value={cfg.trading.token}>
+                  {loadingSymbols ? "Loading…" : "No symbols found"}
+                </option>
+              )}
+              {symbols.map((s) => (
+                <option key={s} value={s}>
+                  {s}
+                </option>
+              ))}
+            </select>
+          </Field>
+          <Field label="Grid distance (± from initial mid)">
             <NumInput
-              v={cfg.trading.grid_lower}
-              on={(v) => update("trading", "grid_lower", v)}
+              v={cfg.trading.grid_distance}
+              on={(v) => update("trading", "grid_distance", v)}
             />
           </Field>
-          <Field label="Grid upper">
-            <NumInput
-              v={cfg.trading.grid_upper}
-              on={(v) => update("trading", "grid_upper", v)}
-            />
-          </Field>
-          <Field label="Grid step">
+          <Field label="Average (price spacing per step)">
             <NumInput
               v={cfg.trading.grid_step}
               on={(v) => update("trading", "grid_step", v)}
+            />
+          </Field>
+          <Field label="Grid depth (levels each side)">
+            <NumInput
+              v={cfg.trading.grid_depth}
+              on={(v) =>
+                update("trading", "grid_depth", Math.max(1, Math.round(v)))
+              }
             />
           </Field>
           <Field label="Per-step qty">
@@ -220,7 +500,7 @@ function ConfigPanel({
             />
           </Field>
           <Field label="Max exposure">
-            <div className="input bg-edge font-mono">
+            <div className="input bg-slate-50 font-mono">
               {(cfg.basket.num_baskets * cfg.basket.basket_size_qty).toFixed(4)}
             </div>
           </Field>
@@ -239,6 +519,18 @@ function ConfigPanel({
             <NumInput
               v={cfg.kill_switch.max_daily_loss}
               on={(v) => update("kill_switch", "max_daily_loss", v)}
+            />
+          </Field>
+          <Field label="Max basket hits (cycle resets)">
+            <NumInput
+              v={cfg.kill_switch.max_basket_hits}
+              on={(v) =>
+                update(
+                  "kill_switch",
+                  "max_basket_hits",
+                  Math.max(1, Math.round(v))
+                )
+              }
             />
           </Field>
           <Field label="API disconnect protection">
@@ -278,12 +570,9 @@ function ConfigPanel({
               on={(v) => update("slicing", "max_slippage_bps", v)}
             />
           </Field>
-          <Field label="Book depth levels">
-            <NumInput
-              v={cfg.slicing.book_depth_levels}
-              on={(v) => update("slicing", "book_depth_levels", Math.round(v))}
-            />
-          </Field>
+          {/* Book depth levels intentionally hidden — it's a slicing internal
+              (book liquidity probe), distinct from the Trading→Grid depth above.
+              Kept in config with a sane default of 5. */}
           <Field label="Participation rate">
             <NumInput
               v={cfg.slicing.participation_rate}
@@ -300,66 +589,19 @@ function ConfigPanel({
           </Field>
         </div>
       </Section>
-
-      <div className="flex gap-3 pt-2">
-        <button
-          className="btn btn-primary flex-1"
-          disabled={running}
-          onClick={() => startEngine(cfg)}
-        >
-          ▶ Submit & Start
-        </button>
-        <button
-          className="btn btn-ghost"
-          disabled={!running}
-          onClick={stopEngine}
-        >
-          ■ Stop
-        </button>
-      </div>
-      <div className="flex gap-3">
-        <button
-          className="btn btn-danger flex-1"
-          disabled={!running || tripped}
-          onClick={killSwitch}
-        >
-          ⚠ KILL SWITCH
-        </button>
-        <button
-          className="btn btn-ghost"
-          disabled={!tripped}
-          onClick={resetKillSwitch}
-        >
-          Reset
-        </button>
-      </div>
     </div>
   );
 }
 
-function Section({
-  title,
-  children,
-}: {
-  title: string;
-  children: React.ReactNode;
-}) {
+function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <div>
-      <h3 className="text-accent font-mono text-xs tracking-widest mb-3">
-        {title.toUpperCase()}
-      </h3>
+      <h3 className="mb-3">{title}</h3>
       <div className="space-y-3">{children}</div>
     </div>
   );
 }
-function Field({
-  label,
-  children,
-}: {
-  label: string;
-  children: React.ReactNode;
-}) {
+function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div>
       <div className="label mb-1">{label}</div>
@@ -368,13 +610,47 @@ function Field({
   );
 }
 function NumInput({ v, on }: { v: number; on: (n: number) => void }) {
+  // Keep a local string while the user types so backspace can clear "0",
+  // negative signs / decimals don't snap back, etc. Only push numeric updates
+  // upstream when the string parses cleanly.
+  const [raw, setRaw] = useState<string>(String(v));
+  // Sync external value changes (e.g., resetting form) into our raw state.
+  useEffect(() => {
+    // If the parsed local matches the upstream value, leave the raw alone
+    // (preserves intermediate state like "0." while typing).
+    if (parseFloat(raw) !== v) {
+      setRaw(String(v));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [v]);
   return (
     <input
       className="input"
-      type="number"
-      value={v}
-      step="any"
-      onChange={(e) => on(parseFloat(e.target.value) || 0)}
+      type="text"
+      inputMode="decimal"
+      value={raw}
+      onChange={(e) => {
+        const next = e.target.value;
+        // Allow empty / partial numeric strings while editing.
+        if (next === "" || next === "-" || next === "." || next === "-.") {
+          setRaw(next);
+          on(0);
+          return;
+        }
+        // Only accept valid numeric input.
+        if (/^-?\d*\.?\d*$/.test(next)) {
+          setRaw(next);
+          const parsed = parseFloat(next);
+          if (!isNaN(parsed)) on(parsed);
+        }
+      }}
+      onBlur={() => {
+        // On blur, normalize empty back to "0".
+        if (raw === "" || raw === "-" || raw === "." || raw === "-.") {
+          setRaw("0");
+          on(0);
+        }
+      }}
     />
   );
 }
@@ -382,113 +658,59 @@ function Toggle({ v, on }: { v: boolean; on: (b: boolean) => void }) {
   return (
     <button
       onClick={() => on(!v)}
-      className={`input text-left ${v ? "text-accent" : "text-muted"}`}
+      className={`input text-left font-semibold ${
+        v ? "text-accent" : "text-muted"
+      }`}
     >
       {v ? "● ENABLED" : "○ DISABLED"}
     </button>
   );
 }
 
-/* ---------- Dashboard ---------- */
-function Dashboard({ snap }: { snap: Snapshot | null }) {
-  if (!snap) {
-    return (
-      <div className="panel p-6 text-muted">
-        Engine not started. Configure the parameters and click{" "}
-        <span className="text-accent">Submit & Start</span>.
-      </div>
-    );
-  }
+/* ===================================================================
+   BASKETS
+   =================================================================== */
+function BasketGrid({ snap }: { snap: Snapshot | null }) {
+  if (!snap) return <EmptyState text="No data yet" />;
   return (
-    <div className="space-y-6">
-      <KPIRow snap={snap} />
-      <BasketGrid snap={snap} />
-      <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
-        <OpenOrders snap={snap} />
-        <RecentFills snap={snap} />
-      </div>
-      <RiskAndLog snap={snap} />
+    <div className="grid grid-cols-2 md:grid-cols-3 gap-3 pt-4">
+      {snap.baskets.map((b) => (
+        <BasketCard key={b.basket_id} b={b} />
+      ))}
     </div>
   );
 }
 
-function KPIRow({ snap }: { snap: Snapshot }) {
-  const killed = snap.baskets.filter((b) => b.status === "KILLED").length;
-  return (
-    <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-      <KPI label="Mid Price" v={snap.mid_price.toFixed(2)} />
-      <KPI label="Open Qty" v={snap.total_open_qty.toFixed(4)} />
-      <KPI
-        label="Realized PnL"
-        v={snap.total_realized_pnl.toFixed(2)}
-        color={snap.total_realized_pnl >= 0 ? "good" : "danger"}
-      />
-      <KPI
-        label="Baskets Killed"
-        v={`${killed}/${snap.baskets.length}`}
-        color={killed > 0 ? "warn" : "muted"}
-      />
-    </div>
-  );
-}
-function KPI({
-  label,
-  v,
-  color = "muted",
-}: {
-  label: string;
-  v: string;
-  color?: string;
-}) {
-  const colorMap: Record<string, string> = {
-    good: "text-good",
-    danger: "text-danger",
-    warn: "text-warn",
-    muted: "",
-  };
-  return (
-    <div className="panel p-4">
-      <div className="label">{label}</div>
-      <div className={`font-mono text-2xl mt-1 ${colorMap[color]}`}>{v}</div>
-    </div>
-  );
-}
-
-function BasketGrid({ snap }: { snap: Snapshot }) {
-  return (
-    <div className="panel p-5">
-      <h3 className="text-accent font-mono text-xs tracking-widest mb-4">
-        BASKETS
-      </h3>
-      <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
-        {snap.baskets.map((b) => (
-          <BasketCard key={b.basket_id} b={b} />
-        ))}
-      </div>
-    </div>
-  );
-}
 function BasketCard({ b }: { b: Snapshot["baskets"][0] }) {
   const colorMap: Record<string, string> = {
     IDLE: "border-edge text-muted",
-    ACTIVE: "border-accent text-accent",
-    TPRECYCLING: "border-good text-good",
-    KILLED: "border-danger text-danger opacity-60",
+    ACTIVE: "border-blue-300 text-blue-700",
+    TPRECYCLING: "border-emerald-300 text-emerald-700",
+    KILLED: "border-rose-300 text-rose-700 opacity-70",
   };
+  const sideBadge =
+    b.side === "LONG"
+      ? "bg-emerald-100 text-emerald-700"
+      : "bg-rose-100 text-rose-700";
   return (
-    <div className={`border rounded-md p-3 ${colorMap[b.status]}`}>
-      <div className="flex justify-between items-center mb-2">
+    <div className={`border rounded-md p-3 bg-white ${colorMap[b.status]}`}>
+      <div className="flex justify-between items-center mb-2 gap-2">
         <span className="font-bold">#{b.index}</span>
-        <span className="text-[10px] tracking-widest">{b.status}</span>
+        <span
+          className={`text-[10px] font-bold px-2 py-0.5 rounded ${sideBadge}`}
+        >
+          {b.side}
+        </span>
+        <span className="text-[10px] tracking-widest ml-auto">{b.status}</span>
       </div>
-      <div className="text-xs font-mono space-y-1 text-white/70">
+      <div className="font-mono space-y-1.5 text-ink/85">
         <Row k="open" v={b.open_qty.toFixed(4)} />
         <Row k="max" v={b.max_qty.toFixed(4)} />
         <Row k="avg" v={b.avg_price > 0 ? b.avg_price.toFixed(2) : "—"} />
         <Row k="SL" v={b.sl_price ? b.sl_price.toFixed(2) : "—"} />
         <Row
           k="PnL"
-          v={b.realized_pnl.toFixed(2)}
+          v={b.realized_pnl.toFixed(4)}
           highlight={b.realized_pnl !== 0}
         />
         <Row k="fills/tp" v={`${b.fills_count}/${b.tp_count}`} />
@@ -506,86 +728,507 @@ function Row({
   highlight?: boolean;
 }) {
   return (
-    <div className="flex justify-between">
-      <span className="text-muted">{k}</span>
-      <span className={highlight ? "text-white" : ""}>{v}</span>
+    <div className="flex justify-between items-baseline">
+      <span className="text-muted text-xs">{k}</span>
+      <span
+        className={`text-sm font-bold tabular-nums ${
+          highlight ? "text-ink" : "text-ink/80"
+        }`}
+      >
+        {v}
+      </span>
     </div>
   );
 }
 
-function OpenOrders({ snap }: { snap: Snapshot }) {
+/* ===================================================================
+   LIVE ORDER BOOK — derived from mid for now (best-effort visual)
+   =================================================================== */
+function LiveOrderBook({ snap }: { snap: Snapshot | null }) {
+  if (!snap || snap.mid_price <= 0) {
+    return <EmptyState text="Waiting for live mid-price…" />;
+  }
   return (
-    <div className="panel p-5">
-      <h3 className="text-accent font-mono text-xs tracking-widest mb-3">
-        OPEN ORDERS ({snap.open_orders.length})
-      </h3>
-      <div className="overflow-y-auto max-h-72 text-xs font-mono">
-        {snap.open_orders.length === 0 && (
-          <div className="text-muted py-4">No open orders</div>
-        )}
-        {snap.open_orders.map((o) => (
-          <div
-            key={o.order_id}
-            className="grid grid-cols-4 gap-2 py-1 border-b border-edge"
-          >
-            <span
-              className={o.side === "BUY" ? "text-good" : "text-warn"}
+    <div className="pt-4 grid grid-cols-2 gap-4">
+      <div>
+        <div className="label mb-2">Bids</div>
+        <div className="font-mono text-xs space-y-1">
+          {[1, 2, 3, 4, 5].map((i) => (
+            <div
+              key={i}
+              className="flex justify-between py-1 px-2 bg-emerald-50/60 rounded"
             >
-              {o.side}
-            </span>
-            <span className="text-muted">{o.purpose}</span>
-            <span>{o.price.toFixed(2)}</span>
-            <span className="text-right">{o.qty.toFixed(4)}</span>
-          </div>
-        ))}
+              <span className="text-emerald-700">
+                {(snap.mid_price - i * 0.5).toFixed(2)}
+              </span>
+              <span className="text-muted">—</span>
+            </div>
+          ))}
+        </div>
+      </div>
+      <div>
+        <div className="label mb-2">Asks</div>
+        <div className="font-mono text-xs space-y-1">
+          {[1, 2, 3, 4, 5].map((i) => (
+            <div
+              key={i}
+              className="flex justify-between py-1 px-2 bg-rose-50/60 rounded"
+            >
+              <span className="text-rose-700">
+                {(snap.mid_price + i * 0.5).toFixed(2)}
+              </span>
+              <span className="text-muted">—</span>
+            </div>
+          ))}
+        </div>
       </div>
     </div>
   );
 }
 
-function RecentFills({ snap }: { snap: Snapshot }) {
+/* ===================================================================
+   OPEN ORDERS
+   =================================================================== */
+function OpenOrders({ snap }: { snap: Snapshot | null }) {
+  if (!snap) return <EmptyState text="No data yet" />;
+  if (snap.open_orders.length === 0)
+    return <EmptyState text="No open orders" />;
   return (
-    <div className="panel p-5">
-      <h3 className="text-accent font-mono text-xs tracking-widest mb-3">
-        RECENT FILLS
-      </h3>
-      <div className="overflow-y-auto max-h-72 text-xs font-mono">
-        {snap.recent_fills.length === 0 && (
-          <div className="text-muted py-4">No fills yet</div>
-        )}
-        {[...snap.recent_fills].reverse().map((f) => (
-          <div
-            key={f.fill_id}
-            className="grid grid-cols-4 gap-2 py-1 border-b border-edge"
-          >
-            <span
-              className={
-                f.purpose === "entry"
-                  ? "text-good"
-                  : f.purpose === "take_profit"
-                  ? "text-accent"
-                  : "text-danger"
-              }
-            >
-              {f.purpose}
-            </span>
-            <span>{f.side}</span>
-            <span>{f.price.toFixed(2)}</span>
-            <span className="text-right">{f.qty.toFixed(4)}</span>
-          </div>
-        ))}
+    <div className="pt-4 overflow-x-auto">
+      <table className="w-full text-xs font-mono">
+        <thead className="text-muted text-[11px] uppercase">
+          <tr>
+            <Th>Side</Th>
+            <Th>Purpose</Th>
+            <Th right>Price</Th>
+            <Th right>Qty</Th>
+          </tr>
+        </thead>
+        <tbody>
+          {snap.open_orders.map((o) => (
+            <tr key={o.order_id} className="border-t border-edge">
+              <Td>
+                <span
+                  className={
+                    o.side === "BUY"
+                      ? "text-good font-semibold"
+                      : "text-danger font-semibold"
+                  }
+                >
+                  {o.side}
+                </span>
+              </Td>
+              <Td>
+                <span className="text-muted">{o.purpose}</span>
+              </Td>
+              <Td right>{o.price.toFixed(2)}</Td>
+              <Td right>{o.qty.toFixed(4)}</Td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/* ===================================================================
+   TRADE SUMMARY — the 16-KPI grid (the heart of the screenshot)
+   =================================================================== */
+function TradeSummary({ snap }: { snap: Snapshot | null }) {
+  const ts: TradeStats = snap?.trade_stats ?? {
+    start_time: 0,
+    duration_seconds: 0,
+    total_pnl: 0,
+    net_pnl: 0,
+    rtp_pnl: 0,
+    sl_pnl: 0,
+    total_fees: 0,
+    round_trips: 0,
+    sl_count: 0,
+    rtp_per_hour: 0,
+    pnl_per_hour: 0,
+    buy_vwap: 0,
+    sell_vwap: 0,
+    total_volume: 0,
+    buy_volume: 0,
+    sell_volume: 0,
+    buy_qty: 0,
+    sell_qty: 0,
+    net_qty: 0,
+    total_fills: 0,
+    total_buys: 0,
+    total_sells: 0,
+  };
+  const durationStr = useMemo(
+    () => formatDuration(ts.duration_seconds),
+    [ts.duration_seconds]
+  );
+  const netColor = colorForSigned(ts.net_pnl);
+  const pnlPerHourColor = colorForSigned(ts.pnl_per_hour);
+  const netQtyColor = colorForSigned(ts.net_qty);
+
+  return (
+    <div className="pt-4 grid grid-cols-2 md:grid-cols-4 gap-3">
+      {/* Row 1 — headline PnLs (separated per user spec). */}
+      <KPI label="Net PnL" v={fmt(ts.net_pnl, 4)} color={netColor} />
+      <KPI label="RTP PnL (TPs)" v={fmt(ts.rtp_pnl, 4)} color="text-good" />
+      <KPI label="SL PnL" v={fmt(ts.sl_pnl, 4)} color="text-danger" />
+      <KPI label="PnL / Hour" v={fmt(ts.pnl_per_hour, 4)} color={pnlPerHourColor} />
+
+      {/* Row 2 — trip counts and timing. */}
+      <KPI label="Round Trips" v={ts.round_trips.toString()} color="text-good" />
+      <KPI label="SL Count" v={ts.sl_count.toString()} color="text-danger" />
+      <KPI label="RTP / Hour" v={Math.round(ts.rtp_per_hour).toString()} />
+      <KPI label="Duration" v={durationStr} />
+
+      {/* Row 3 — VWAPs and volumes (USD). */}
+      <KPI label="Buy VWAP" v={fmt(ts.buy_vwap, 4)} color="text-good" />
+      <KPI label="Sell VWAP" v={fmt(ts.sell_vwap, 4)} color="text-danger" />
+      <KPI label="Total Volume" v={fmt(ts.total_volume, 2)} color="text-muted" />
+      <KPI label="Total Fees" v={fmt(ts.total_fees, 4)} color="text-muted" />
+
+      {/* Row 4 — buys/sells split. */}
+      <KPI label="Buy Volume" v={fmt(ts.buy_volume, 2)} color="text-good" />
+      <KPI label="Sell Volume" v={fmt(ts.sell_volume, 2)} color="text-danger" />
+      <KPI label="Total Buys" v={ts.total_buys.toString()} color="text-good" />
+      <KPI label="Total Sells" v={ts.total_sells.toString()} color="text-danger" />
+
+      {/* Row 5 — qty + fills. */}
+      <KPI label="Buy Qty" v={fmt(ts.buy_qty, 4)} color="text-good" />
+      <KPI label="Sell Qty" v={fmt(ts.sell_qty, 4)} color="text-danger" />
+      <KPI label="Net Qty" v={fmt(ts.net_qty, 4)} color={netQtyColor} />
+      <KPI label="Total Fills" v={ts.total_fills.toString()} />
+    </div>
+  );
+}
+
+function KPI({
+  label,
+  v,
+  color = "text-ink",
+}: {
+  label: string;
+  v: string;
+  color?: string;
+}) {
+  return (
+    <div className="rounded-md border border-edge bg-white p-3">
+      <div className="text-[10px] font-bold text-muted tracking-wider uppercase">
+        {label}
+      </div>
+      <div className={`font-mono text-lg font-bold mt-1 tabular-nums ${color}`}>
+        {v}
       </div>
     </div>
   );
 }
 
-function RiskAndLog({ snap }: { snap: Snapshot }) {
+/* ===================================================================
+   TRADE HISTORY — every INDIVIDUAL fill (entries + TPs + SLs)
+   =================================================================== */
+function TradeHistory({ snap }: { snap: Snapshot | null }) {
+  const fills = snap?.recent_fills ?? [];
+  if (fills.length === 0) {
+    return <EmptyState text="No fills yet" />;
+  }
+  // Newest first in the UI.
+  const reversed = [...fills].reverse();
   return (
-    <div className="grid grid-cols-1 xl:grid-cols-[1fr_2fr] gap-6">
-      <div className="panel p-5">
-        <h3 className="text-accent font-mono text-xs tracking-widest mb-3">
-          RISK ENGINE
-        </h3>
+    <div className="pt-4">
+      <div className="flex justify-between items-center mb-3">
+        <div className="text-xs text-muted">
+          {fills.length} individual fill{fills.length === 1 ? "" : "s"}
+          {fills.length >= 1000 && (
+            <span className="ml-1 text-warn">(buffer cap — older fills evicted)</span>
+          )}
+        </div>
+        <button
+          className="btn btn-ghost text-xs"
+          onClick={() => downloadFillsCsv([...fills])}
+        >
+          ⬇ Download CSV
+        </button>
+      </div>
+      <div className="overflow-x-auto max-h-96 overflow-y-auto">
+        <table className="w-full text-sm">
+          <thead className="text-muted text-[11px] uppercase sticky top-0 bg-white">
+            <tr>
+              <Th>#</Th>
+              <Th>Time</Th>
+              <Th>Basket</Th>
+              <Th>Side</Th>
+              <Th>Purpose</Th>
+              <Th right>Price</Th>
+              <Th right>Qty</Th>
+              <Th right>Fee</Th>
+            </tr>
+          </thead>
+          <tbody>
+            {reversed.map((f, idx) => {
+              const n = fills.length - idx;
+              const sideCls =
+                f.side === "BUY" ? "text-good font-bold" : "text-danger font-bold";
+              const purposeLabel = purposeText(f.purpose);
+              const purposeCls = purposeColor(f.purpose);
+              return (
+                <tr key={f.fill_id} className="border-t border-edge">
+                  <Td>
+                    <span className="text-muted font-bold">{n}</span>
+                  </Td>
+                  <Td>
+                    <span className="text-muted">
+                      {new Date(f.timestamp).toLocaleTimeString()}
+                    </span>
+                  </Td>
+                  <Td>#{/* basket index isn't on Fill — show id stub */}
+                    <span className="text-muted">
+                      {f.basket_id.slice(0, 4)}…
+                    </span>
+                  </Td>
+                  <Td>
+                    <span className={sideCls}>{f.side}</span>
+                  </Td>
+                  <Td>
+                    <span className={purposeCls + " font-semibold"}>{purposeLabel}</span>
+                  </Td>
+                  <Td right>
+                    <span className="font-bold">${f.price.toFixed(2)}</span>
+                  </Td>
+                  <Td right>
+                    <span className="font-bold">{f.qty.toFixed(4)}</span>
+                  </Td>
+                  <Td right>
+                    <span className="text-muted">{f.fee.toFixed(4)}</span>
+                  </Td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function purposeText(p: string): string {
+  switch (p) {
+    case "entry":
+      return "ENTRY";
+    case "take_profit":
+      return "TP";
+    case "stop_loss_exit":
+      return "SL";
+    case "kill_switch_exit":
+      return "KILL";
+    default:
+      return p.toUpperCase();
+  }
+}
+function purposeColor(p: string): string {
+  switch (p) {
+    case "entry":
+      return "text-accent";
+    case "take_profit":
+      return "text-good";
+    case "stop_loss_exit":
+    case "kill_switch_exit":
+      return "text-danger";
+    default:
+      return "text-muted";
+  }
+}
+
+/// CSV export for every individual fill (Trade History view).
+function downloadFillsCsv(fills: Snapshot["recent_fills"]) {
+  if (fills.length === 0) return;
+  const header = "FILL_COUNT,TIME,SIDE,PURPOSE,PRICE,QTY,FEE,BASKET_ID";
+  const rows = fills.map((f, i) => {
+    return [
+      i + 1,
+      new Date(f.timestamp).toISOString(),
+      f.side,
+      purposeText(f.purpose),
+      f.price,
+      f.qty,
+      f.fee.toFixed(6),
+      f.basket_id,
+    ].join(",");
+  });
+  const csv = [header, ...rows].join("\n");
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  const ts = new Date().toISOString().replace(/[:.]/g, "-");
+  a.download = `fills_${ts}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+/* ===================================================================
+   ROUND TRIPS — paired entry + closing fill, with PnL
+   =================================================================== */
+function RoundTripsPanel({ snap }: { snap: Snapshot | null }) {
+  const hasData = !!snap && snap.round_trips.length > 0;
+  // snap.round_trips comes newest-first; reverse for chronological CSV.
+  const chronological: RoundTrip[] = hasData
+    ? [...snap!.round_trips].reverse()
+    : [];
+
+  return (
+    <div className="pt-4">
+      <div className="flex justify-between items-center mb-3">
+        <div className="text-xs text-muted">
+          {hasData
+            ? `${chronological.length} completed round-trips`
+            : "No completed round-trips yet"}
+        </div>
+        <button
+          className="btn btn-ghost text-xs"
+          disabled={!hasData}
+          onClick={() => downloadRoundTripsCsv(chronological)}
+        >
+          ⬇ Download CSV
+        </button>
+      </div>
+      {hasData && (
+        <div className="overflow-x-auto max-h-96 overflow-y-auto">
+          <table className="w-full text-sm">
+            <thead className="text-muted text-[11px] uppercase sticky top-0 bg-white">
+              <tr>
+                <Th>#</Th>
+                <Th>Side</Th>
+                <Th right>Buy</Th>
+                <Th right>Sell</Th>
+                <Th right>Qty</Th>
+                <Th right>PnL</Th>
+                <Th right>Volume</Th>
+                <Th right>When</Th>
+              </tr>
+            </thead>
+            <tbody>
+              {/* Display newest first in the UI table; CSV is chronological. */}
+              {snap!.round_trips.map((r, idx) => {
+                const rtpCount = snap!.round_trips.length - idx;
+                const isLong = r.entry_side === "BUY";
+                // Long: buy first → sell.   Short: sell first → buy.
+                const buyPx = isLong ? r.entry_price : r.exit_price;
+                const sellPx = isLong ? r.exit_price : r.entry_price;
+                const sideText = isLong ? "BUY → SELL" : "SELL → BUY";
+                const sideClass = isLong ? "text-good" : "text-danger";
+                return (
+                  <tr key={r.rtp_id} className="border-t border-edge">
+                    <Td>
+                      <span className="text-muted font-bold">{rtpCount}</span>
+                    </Td>
+                    <Td>
+                      <span
+                        className={`${sideClass} font-bold`}
+                        title={
+                          r.is_take_profit
+                            ? "Closed by take-profit"
+                            : "Closed by stop-loss"
+                        }
+                      >
+                        {sideText}
+                        {!r.is_take_profit && (
+                          <span className="ml-1 text-[10px] text-danger">
+                            (SL)
+                          </span>
+                        )}
+                      </span>
+                    </Td>
+                    <Td right>
+                      <span className="text-good font-bold">
+                        ${buyPx.toFixed(4)}
+                      </span>
+                    </Td>
+                    <Td right>
+                      <span className="text-danger font-bold">
+                        ${sellPx.toFixed(4)}
+                      </span>
+                    </Td>
+                    <Td right>
+                      <span className="font-bold">{r.qty.toFixed(4)}</span>
+                    </Td>
+                    <Td right>
+                      <span
+                        className={`font-bold ${colorForSigned(r.pnl)}`}
+                      >
+                        {r.pnl >= 0 ? "+" : ""}${r.pnl.toFixed(4)}
+                      </span>
+                    </Td>
+                    <Td right>
+                      <span className="text-muted font-bold">
+                        ${r.volume.toFixed(2)}
+                      </span>
+                    </Td>
+                    <Td right>
+                      <span className="text-muted">
+                        {new Date(r.exit_time).toLocaleTimeString()}
+                      </span>
+                    </Td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/// Build a CSV blob and trigger a download. Columns mirror the UI layout:
+/// RTP_COUNT, SIDE, BUY, SELL, QTY, PNL, VOLUME, FEES, CLOSE, TIME
+function downloadRoundTripsCsv(rtps: RoundTrip[]) {
+  if (rtps.length === 0) return;
+  const header =
+    "RTP_COUNT,SIDE,BUY,SELL,QTY,PNL,VOLUME,FEES,CLOSE,TIME";
+  const rows = rtps.map((r, i) => {
+    const isLong = r.entry_side === "BUY";
+    const side = isLong ? "BUY->SELL" : "SELL->BUY";
+    const buyPx = isLong ? r.entry_price : r.exit_price;
+    const sellPx = isLong ? r.exit_price : r.entry_price;
+    const close = r.is_take_profit ? "TP" : "SL";
+    const time = new Date(r.exit_time).toISOString();
+    return [
+      i + 1,
+      side,
+      buyPx,
+      sellPx,
+      r.qty,
+      r.pnl.toFixed(6),
+      r.volume.toFixed(2),
+      r.fees.toFixed(6),
+      close,
+      time,
+    ].join(",");
+  });
+  const csv = [header, ...rows].join("\n");
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  const ts = new Date().toISOString().replace(/[:.]/g, "-");
+  a.download = `trade_history_${ts}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+/* ===================================================================
+   RISK + LOG
+   =================================================================== */
+function RiskAndLog({ snap }: { snap: Snapshot | null }) {
+  if (!snap) return <EmptyState text="No data yet" />;
+  return (
+    <div className="pt-4 grid grid-cols-1 xl:grid-cols-[1fr_2fr] gap-6">
+      <div>
+        <h3 className="mb-3">Risk Engine</h3>
         <div className="space-y-2 text-sm font-mono">
           <RiskLine k="Max exposure" ok={snap.risk.max_exposure_ok} />
           <RiskLine k="Daily loss" ok={snap.risk.daily_loss_ok} />
@@ -596,23 +1239,21 @@ function RiskAndLog({ snap }: { snap: Snapshot }) {
           <RiskLine k="Runaway exec" ok={snap.risk.runaway_ok} />
         </div>
         {snap.risk.breach_reason && (
-          <div className="mt-3 text-danger text-xs">
+          <div className="mt-3 text-danger text-xs font-semibold">
             BREACH: {snap.risk.breach_reason}
           </div>
         )}
         {snap.kill_switch_reason && (
-          <div className="mt-3 text-danger text-xs">
+          <div className="mt-3 text-danger text-xs font-semibold">
             KILL: {snap.kill_switch_reason}
           </div>
         )}
       </div>
-      <div className="panel p-5">
-        <h3 className="text-accent font-mono text-xs tracking-widest mb-3">
-          ENGINE LOG
-        </h3>
+      <div>
+        <h3 className="mb-3">Engine Log</h3>
         <div className="overflow-y-auto max-h-72 text-xs font-mono space-y-1">
           {[...snap.log].reverse().map((l, i) => (
-            <div key={i} className="text-white/70">
+            <div key={i} className="text-ink/75">
               {l}
             </div>
           ))}
@@ -625,9 +1266,87 @@ function RiskLine({ k, ok }: { k: string; ok: boolean }) {
   return (
     <div className="flex justify-between">
       <span className="text-muted">{k}</span>
-      <span className={ok ? "text-good" : "text-danger"}>
+      <span
+        className={
+          ok ? "text-good font-semibold" : "text-danger font-semibold"
+        }
+      >
         {ok ? "● OK" : "○ BREACH"}
       </span>
     </div>
   );
+}
+
+/* ===================================================================
+   Small utilities
+   =================================================================== */
+function Th({
+  children,
+  right,
+}: {
+  children: React.ReactNode;
+  right?: boolean;
+}) {
+  return (
+    <th className={`px-2 py-1 ${right ? "text-right" : "text-left"} font-bold`}>
+      {children}
+    </th>
+  );
+}
+function Td({
+  children,
+  right,
+}: {
+  children: React.ReactNode;
+  right?: boolean;
+}) {
+  return (
+    <td className={`px-2 py-1.5 ${right ? "text-right" : "text-left"}`}>
+      {children}
+    </td>
+  );
+}
+
+function EmptyState({ text }: { text: string }) {
+  return <div className="text-muted text-sm py-6 text-center">{text}</div>;
+}
+
+function Loading() {
+  return (
+    <div className="min-h-screen flex items-center justify-center text-muted">
+      Loading…
+    </div>
+  );
+}
+function ErrorBox({ msg }: { msg: string }) {
+  return (
+    <div className="min-h-screen flex items-center justify-center p-6">
+      <div className="panel p-6 max-w-lg">
+        <div className="text-danger font-bold mb-2">Backend unreachable</div>
+        <div className="text-sm text-muted">{msg}</div>
+      </div>
+    </div>
+  );
+}
+
+function fmt(n: number, digits: number): string {
+  if (!isFinite(n)) return "—";
+  return n.toLocaleString("en-US", {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits,
+  });
+}
+function colorForSigned(n: number): string {
+  if (n > 0) return "text-good";
+  if (n < 0) return "text-danger";
+  return "text-ink";
+}
+function formatDuration(sec: number): string {
+  if (sec <= 0) return "0s";
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  if (h > 0) return `${(h + m / 60).toFixed(2)}h`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
 }

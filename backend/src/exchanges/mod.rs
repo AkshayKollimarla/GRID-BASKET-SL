@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 pub mod deribit;
 pub mod hyperliquid;
+pub mod instruments;
 pub mod mock;
 pub use deribit::DeribitClient;
 pub use hyperliquid::HyperliquidClient;

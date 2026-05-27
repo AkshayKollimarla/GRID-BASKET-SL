@@ -148,6 +148,7 @@ impl Exchange for MockExchange {
             side,
             price: fill_price,
             qty,
+            fee: 0.0, // mock = no fees
             timestamp: Utc::now().timestamp_millis(),
         };
         let _ = self.fills_tx.send(fill);
@@ -198,6 +199,7 @@ impl Exchange for MockExchange {
                 side: o.side,
                 price: o.price,
                 qty: o.qty,
+                fee: 0.0, // mock = no fees
                 timestamp: Utc::now().timestamp_millis(),
             };
             let _ = self.fills_tx.send(fill);

@@ -1,13 +1,15 @@
 use crate::engine::{spawn_engine, EngineHandle};
+use crate::exchanges::instruments;
 use crate::models::AgentConfig;
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
 use parking_lot::RwLock;
+use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
@@ -27,6 +29,7 @@ pub fn router() -> Router {
     Router::new()
         .route("/api/health", get(health))
         .route("/api/config/default", get(default_config))
+        .route("/api/instruments", get(instruments_handler))
         .route("/api/start", post(start))
         .route("/api/stop", post(stop))
         .route("/api/snapshot", get(snapshot))
@@ -34,6 +37,35 @@ pub fn router() -> Router {
         .route("/api/reset", post(reset))
         .with_state(state)
         .layer(cors)
+}
+
+#[derive(Debug, Deserialize)]
+struct InstrumentsQuery {
+    exchange: String,
+}
+
+async fn instruments_handler(Query(q): Query<InstrumentsQuery>) -> impl IntoResponse {
+    let result: Result<Vec<String>, String> = match q.exchange.to_lowercase().as_str() {
+        "deribit" => instruments::fetch_deribit_perps()
+            .await
+            .map_err(|e| e.to_string()),
+        "hyperliquid" => instruments::fetch_hyperliquid_perps()
+            .await
+            .map_err(|e| e.to_string()),
+        "mock" => Ok(vec![
+            "BTC-MOCK".into(),
+            "ETH-MOCK".into(),
+            "SOL-MOCK".into(),
+        ]),
+        other => Err(format!("unknown exchange: {}", other)),
+    };
+    match result {
+        Ok(symbols) => (StatusCode::OK, Json(json!({ "symbols": symbols }))),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": e, "symbols": [] })),
+        ),
+    }
 }
 
 async fn health() -> impl IntoResponse {

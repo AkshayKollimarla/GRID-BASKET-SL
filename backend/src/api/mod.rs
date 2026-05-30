@@ -8,6 +8,7 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
+use dashmap::DashMap;
 use parking_lot::RwLock;
 use serde::Deserialize;
 use serde_json::json;
@@ -16,10 +17,13 @@ use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 
 pub struct AppState {
-    pub engine: RwLock<Option<Arc<EngineHandle>>>,
-    /// Persistent store of saved agent configs (= inactive agents that the
-    /// user wants to keep around). Loaded from disk on startup, written
-    /// back on every save/delete. Keyed by `AgentConfig.name`.
+    /// Currently RUNNING engines, keyed by agent name. Multi-bot —
+    /// each agent name maps to its own EngineHandle. Stopping an
+    /// engine removes it from this map; the saved config in
+    /// `saved_agents` stays so the user can restart later.
+    pub engines: DashMap<String, Arc<EngineHandle>>,
+    /// Persistent store of saved agent configs (= the sidebar list).
+    /// Loaded from disk on startup, written back on every save/delete.
     pub saved_agents: RwLock<Vec<AgentConfig>>,
     /// Path to the on-disk JSON file. `agents.json` in the backend's
     /// working directory by default; override via `AGENTS_FILE` env var.
@@ -52,6 +56,24 @@ impl AppState {
             Err(e) => tracing::warn!(?e, "could not serialize saved agents"),
         }
     }
+
+    /// Return the engine for `name` ONLY if it's still flagged running.
+    /// If running is false (engine self-stopped after all_killed), the
+    /// stale handle is removed from the map first.
+    fn live_engine(&self, name: &str) -> Option<Arc<EngineHandle>> {
+        let still_running = self
+            .engines
+            .get(name)
+            .map(|e| e.value().running.load(std::sync::atomic::Ordering::Relaxed));
+        match still_running {
+            Some(true) => self.engines.get(name).map(|e| e.value().clone()),
+            Some(false) => {
+                self.engines.remove(name);
+                None
+            }
+            None => None,
+        }
+    }
 }
 
 pub fn router() -> Router {
@@ -61,7 +83,7 @@ pub fn router() -> Router {
     let saved = AppState::load_saved_agents(&agents_path);
     tracing::info!(loaded = saved.len(), ?agents_path, "saved agents loaded");
     let state = Arc::new(AppState {
-        engine: RwLock::new(None),
+        engines: DashMap::new(),
         saved_agents: RwLock::new(saved),
         agents_path,
     });
@@ -73,14 +95,17 @@ pub fn router() -> Router {
         .route("/api/health", get(health))
         .route("/api/config/default", get(default_config))
         .route("/api/instruments", get(instruments_handler))
+        // Multi-bot endpoints — agent name in the URL path. The body of
+        // /api/start still contains the full config so the engine can be
+        // spawned freshly.
         .route("/api/start", post(start))
-        .route("/api/stop", post(stop))
-        .route("/api/snapshot", get(snapshot))
-        .route("/api/kill", post(kill))
-        .route("/api/reset", post(reset))
-        .route("/api/force_flatten", post(force_flatten))
-        // Saved-agents CRUD — used by the sidebar to list inactive agents,
-        // re-load their configs into the form, and delete them.
+        .route("/api/stop/:name", post(stop))
+        .route("/api/snapshot/:name", get(snapshot))
+        .route("/api/kill/:name", post(kill))
+        .route("/api/reset/:name", post(reset))
+        .route("/api/force_flatten/:name", post(force_flatten))
+        // Saved-agents CRUD — used by the sidebar to list all configs,
+        // re-load them into the form, and delete them.
         .route("/api/agents", get(list_agents).post(save_agent))
         .route("/api/agents/:name", delete(delete_agent))
         .with_state(state)
@@ -124,31 +149,40 @@ async fn default_config() -> impl IntoResponse {
     Json(AgentConfig::default_demo())
 }
 
+/// Start an engine for the named agent. Body = full AgentConfig.
+/// Rejects if an engine with the same name is already running.
+/// Auto-persists the config so it appears in the sidebar.
 async fn start(
     State(state): State<Arc<AppState>>,
     Json(cfg): Json<AgentConfig>,
 ) -> impl IntoResponse {
-    {
-        let g = state.engine.read();
-        if let Some(eng) = g.as_ref() {
-            if eng.running.load(std::sync::atomic::Ordering::Relaxed) {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({ "error": "engine already running" })),
-                );
-            }
-        }
+    let name = cfg.name.trim().to_string();
+    if name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "agent name cannot be empty" })),
+        );
     }
-    // Auto-save / upsert this config in the saved-agents store so it shows
-    // up in the sidebar even after stop, and so the user can re-edit it
-    // without retyping every field.
-    upsert_saved(&state, cfg.clone());
-    match EngineHandle::new(cfg).await {
+    if state.live_engine(&name).is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("agent '{}' is already running", name) })),
+        );
+    }
+    // Persist the config (insert or update) so the sidebar shows it.
+    let mut to_save = cfg.clone();
+    to_save.name = name.clone();
+    upsert_saved(&state, to_save.clone());
+
+    match EngineHandle::new(to_save).await {
         Ok((handle, fills_rx)) => {
             let handle = Arc::new(handle);
             spawn_engine(handle.clone(), fills_rx);
-            *state.engine.write() = Some(handle);
-            (StatusCode::OK, Json(json!({ "status": "started" })))
+            state.engines.insert(name.clone(), handle);
+            (
+                StatusCode::OK,
+                Json(json!({ "status": "started", "name": name })),
+            )
         }
         Err(e) => (
             StatusCode::BAD_REQUEST,
@@ -171,61 +205,86 @@ fn upsert_saved(state: &AppState, cfg: AgentConfig) {
     state.persist();
 }
 
-async fn stop(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    if let Some(eng) = state.engine.read().as_ref() {
+async fn stop(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    if let Some(eng) = state.live_engine(&name) {
         eng.running
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        eng.log_line("Engine stopped by user.".to_string());
+        eng.log_line(format!("Engine '{}' stopped by user.", name));
     }
-    Json(json!({ "status": "stopped" }))
+    // Remove the entry — caller can re-start by POSTing /api/start.
+    state.engines.remove(&name);
+    Json(json!({ "status": "stopped", "name": name }))
 }
 
-async fn snapshot(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let eng_opt = { state.engine.read().clone() };
-    match eng_opt {
+async fn snapshot(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    match state.live_engine(&name) {
         Some(eng) => Json(json!(eng.snapshot().await)).into_response(),
-        None => Json(json!({ "running": false, "message": "engine not started" })).into_response(),
+        None => Json(json!({ "running": false, "message": format!("agent '{}' is not running", name) })).into_response(),
     }
 }
 
-async fn kill(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let eng_opt = { state.engine.read().clone() };
-    if let Some(eng) = eng_opt {
-        eng.kill_switch.trip("manual kill from UI".into()).await;
+async fn kill(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    if let Some(eng) = state.live_engine(&name) {
+        eng.kill_switch
+            .trip(format!("manual kill from UI for '{}'", name))
+            .await;
     }
-    Json(json!({ "status": "kill_switch_tripped" }))
+    Json(json!({ "status": "kill_switch_tripped", "name": name }))
 }
 
-async fn reset(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    if let Some(eng) = state.engine.read().as_ref() {
+async fn reset(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    if let Some(eng) = state.live_engine(&name) {
         eng.kill_switch.manual_reset();
     }
-    Json(json!({ "status": "reset" }))
+    Json(json!({ "status": "reset", "name": name }))
 }
 
-/// List every saved agent config (the "Inactive Agents" sidebar
-/// reads this). Also tells the UI which one is currently running by
-/// name so it can mark it as ACTIVE instead of INACTIVE.
+/// List every saved agent config (the sidebar reads this). Also tells
+/// the UI which ones are currently RUNNING by name so it can group them
+/// under "Active" vs "Inactive" sections.
 async fn list_agents(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let agents = state.saved_agents.read().clone();
-    let active_name = {
-        let g = state.engine.read();
-        g.as_ref().and_then(|eng| {
-            if eng.running.load(std::sync::atomic::Ordering::Relaxed) {
-                Some(eng.config.name.clone())
+    // Garbage-collect any engine whose `running` is now false, then
+    // gather the names of the survivors.
+    let stale: Vec<String> = state
+        .engines
+        .iter()
+        .filter_map(|e| {
+            if !e
+                .value()
+                .running
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                Some(e.key().clone())
             } else {
                 None
             }
         })
-    };
+        .collect();
+    for name in stale {
+        state.engines.remove(&name);
+    }
+    let active: Vec<String> = state.engines.iter().map(|e| e.key().clone()).collect();
     (
         StatusCode::OK,
-        Json(json!({ "agents": agents, "active": active_name })),
+        Json(json!({ "agents": agents, "active": active })),
     )
 }
 
 /// Upsert a saved agent (used by the UI's "Save" button on the form,
-/// also called implicitly on Start). Body = full AgentConfig.
+/// also called implicitly on Start).
 async fn save_agent(
     State(state): State<Arc<AppState>>,
     Json(cfg): Json<AgentConfig>,
@@ -246,11 +305,18 @@ async fn save_agent(
     )
 }
 
-/// Remove a saved agent from the sidebar list.
+/// Remove a saved agent from the sidebar list. Refuses to delete a
+/// currently-running one.
 async fn delete_agent(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
+    if state.live_engine(&name).is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "cannot delete a running agent — stop it first" })),
+        );
+    }
     {
         let mut g = state.saved_agents.write();
         let before = g.len();
@@ -266,23 +332,22 @@ async fn delete_agent(
     (StatusCode::OK, Json(json!({ "status": "deleted", "name": name })))
 }
 
-/// Operator-triggered emergency flatten. Cancels every order, slices every
-/// basket flat, runs a residual mop-up against any leftover exchange
-/// position, then verifies the exchange-side position is zero. Returns
-/// `{ ok, message }` so the UI can show what happened.
-async fn force_flatten(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let eng_opt = { state.engine.read().clone() };
-    match eng_opt {
+/// Operator-triggered emergency flatten for the named running agent.
+async fn force_flatten(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    match state.live_engine(&name) {
         Some(eng) => {
             let (ok, msg) = eng.force_flatten().await;
             (
                 StatusCode::OK,
-                Json(json!({ "ok": ok, "message": msg })),
+                Json(json!({ "ok": ok, "message": msg, "name": name })),
             )
         }
         None => (
             StatusCode::BAD_REQUEST,
-            Json(json!({ "ok": false, "message": "engine not started" })),
+            Json(json!({ "ok": false, "message": format!("agent '{}' is not running", name) })),
         ),
     }
 }

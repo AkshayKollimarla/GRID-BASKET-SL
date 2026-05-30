@@ -178,28 +178,58 @@ export async function getDefaultConfig(): Promise<AgentConfig> {
   return r.json();
 }
 
+/**
+ * Multi-bot API — every action targets a specific agent name. The
+ * backend tracks N engines simultaneously, one per agent, so the user
+ * can run e.g. an ETH bot AND a BTC bot in parallel.
+ */
 export async function startEngine(cfg: AgentConfig) {
-  const r = await fetch(`${BASE}/api/start`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(cfg),
-  });
-  return r.json();
+  try {
+    const r = await fetch(`${BASE}/api/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(cfg),
+    });
+    return await safeJson(r);
+  } catch (e: any) {
+    return { error: e?.message ?? "start failed" };
+  }
 }
 
-export async function stopEngine() {
-  const r = await fetch(`${BASE}/api/stop`, { method: "POST" });
-  return r.json();
+export async function stopEngine(name: string) {
+  try {
+    const r = await fetch(
+      `${BASE}/api/stop/${encodeURIComponent(name)}`,
+      { method: "POST" }
+    );
+    return await safeJson(r);
+  } catch (e: any) {
+    return { error: e?.message ?? "stop failed" };
+  }
 }
 
-export async function killSwitch() {
-  const r = await fetch(`${BASE}/api/kill`, { method: "POST" });
-  return r.json();
+export async function killSwitch(name: string) {
+  try {
+    const r = await fetch(
+      `${BASE}/api/kill/${encodeURIComponent(name)}`,
+      { method: "POST" }
+    );
+    return await safeJson(r);
+  } catch (e: any) {
+    return { error: e?.message ?? "kill failed" };
+  }
 }
 
-export async function resetKillSwitch() {
-  const r = await fetch(`${BASE}/api/reset`, { method: "POST" });
-  return r.json();
+export async function resetKillSwitch(name: string) {
+  try {
+    const r = await fetch(
+      `${BASE}/api/reset/${encodeURIComponent(name)}`,
+      { method: "POST" }
+    );
+    return await safeJson(r);
+  } catch (e: any) {
+    return { error: e?.message ?? "reset failed" };
+  }
 }
 
 /**
@@ -208,26 +238,35 @@ export async function resetKillSwitch() {
  * position, then verifies the exchange-side position is zero.
  * Returns `{ ok, message }`.
  */
-export async function forceFlatten(): Promise<{ ok: boolean; message: string }> {
+export async function forceFlatten(
+  name: string
+): Promise<{ ok: boolean; message: string }> {
   try {
-    const r = await fetch(`${BASE}/api/force_flatten`, { method: "POST" });
-    return r.json();
+    const r = await fetch(
+      `${BASE}/api/force_flatten/${encodeURIComponent(name)}`,
+      { method: "POST" }
+    );
+    const j = await safeJson(r);
+    return {
+      ok: !!j?.ok,
+      message: j?.message ?? j?.error ?? "unknown",
+    };
   } catch (e: any) {
     return { ok: false, message: e?.message ?? "request failed" };
   }
 }
 
 /* ===================================================================
-   SAVED AGENTS — sidebar list of inactive configs.
+   SAVED AGENTS — sidebar list (active + inactive).
    =================================================================== */
 export type AgentList = {
-  /** All persisted saved configs (active + inactive). */
+  /** All persisted saved configs. */
   agents: AgentConfig[];
-  /** Name of the currently-running agent (null if engine isn't running). */
-  active: string | null;
+  /** Names of every agent currently RUNNING (multi-bot). Empty if none. */
+  active: string[];
 };
 
-/** List every saved agent + the currently active one. Tolerates a
+/** List every saved agent + the currently active ones. Tolerates a
  *  backend that doesn't have the /api/agents route yet (empty body /
  *  404) and just shows an empty list rather than crashing.
  */
@@ -235,12 +274,20 @@ export async function listAgents(): Promise<AgentList> {
   try {
     const r = await fetch(`${BASE}/api/agents`, { cache: "no-store" });
     const j = await safeJson(r);
+    // Backend versions before multi-bot returned `active: string | null`.
+    // Normalise either shape to `string[]` so the UI never breaks.
+    let active: string[] = [];
+    if (Array.isArray(j?.active)) {
+      active = j.active.filter((s: any) => typeof s === "string");
+    } else if (typeof j?.active === "string") {
+      active = [j.active];
+    }
     return {
       agents: Array.isArray(j?.agents) ? j.agents : [],
-      active: j?.active ?? null,
+      active,
     };
   } catch {
-    return { agents: [], active: null };
+    return { agents: [], active: [] };
   }
 }
 
@@ -305,9 +352,15 @@ export async function getInstruments(
   }
 }
 
-export async function getSnapshot(): Promise<Snapshot | null> {
+/** Fetch the snapshot for the named running agent. Returns null if
+ *  the agent isn't running (backend returns `{running: false}`). */
+export async function getSnapshot(name: string): Promise<Snapshot | null> {
+  if (!name) return null;
   try {
-    const r = await fetch(`${BASE}/api/snapshot`, { cache: "no-store" });
+    const r = await fetch(
+      `${BASE}/api/snapshot/${encodeURIComponent(name)}`,
+      { cache: "no-store" }
+    );
     const j = await r.json();
     if (j.running === false && !j.baskets) return null;
     return j;

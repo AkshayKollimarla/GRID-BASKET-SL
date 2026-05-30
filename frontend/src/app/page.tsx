@@ -23,14 +23,17 @@ import {
    ROOT
    =================================================================== */
 export default function Home() {
+  // The agent currently in focus — drives the form (`cfg`) and the
+  // snapshot poll (`snap`). null = no agent selected (e.g. user clicked
+  // Create Agent and is filling in a new one that doesn't have a name yet).
   const [cfg, setCfg] = useState<AgentConfig | null>(null);
   const [snap, setSnap] = useState<Snapshot | null>(null);
-  const [agents, setAgents] = useState<AgentList>({ agents: [], active: null });
+  const [agents, setAgents] = useState<AgentList>({ agents: [], active: [] });
   const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
     getDefaultConfig()
-      .then(setCfg)
+      .then((c) => setCfg(c))
       .catch(() =>
         setErr(
           "Cannot reach backend at http://localhost:8080 — is `cargo run` running?"
@@ -38,17 +41,23 @@ export default function Home() {
       );
   }, []);
 
+  // Snapshot polling targets the CURRENTLY SELECTED agent. If the user
+  // hasn't selected one yet (cfg null) or the selected one isn't running,
+  // we still call getSnapshot — it returns null and the UI shows empty.
   useEffect(() => {
-    // 250ms polling — sees fills within at most 1 cycle.
+    const name = cfg?.name;
+    if (!name) {
+      setSnap(null);
+      return;
+    }
     const t = setInterval(async () => {
-      const s = await getSnapshot();
-      if (s) setSnap(s);
+      const s = await getSnapshot(name);
+      setSnap(s);
     }, 250);
     return () => clearInterval(t);
-  }, []);
+  }, [cfg?.name]);
 
-  // Poll the saved-agents list separately and less often — it only
-  // changes on Save/Delete/Start, so 2s is plenty and saves traffic.
+  // Poll the saved-agents list separately and less often.
   useEffect(() => {
     let cancelled = false;
     const refresh = async () => {
@@ -68,14 +77,30 @@ export default function Home() {
 
   const refreshAgents = async () => setAgents(await listAgents());
 
+  /** Open the form with a fresh config — used by the "+ Create Agent"
+   *  button. We use the default-demo config as a template but give it
+   *  an empty name so the user is forced to enter one. */
+  const createAgent = async () => {
+    const fresh = await getDefaultConfig();
+    fresh.name = "";
+    setCfg(fresh);
+    setSnap(null);
+  };
+
+  /** Switch the focus to an existing saved agent. Loads its config into
+   *  the form and starts polling its snapshot (if running). */
+  const selectAgent = (a: AgentConfig) => {
+    setCfg({ ...a });
+    setSnap(null);
+  };
+
   return (
     <main className="min-h-screen flex">
       <AgentsSidebar
         agents={agents}
-        activeName={agents.active}
         currentName={cfg.name}
-        running={snap?.running ?? false}
-        onEdit={(loaded) => setCfg(loaded)}
+        onSelect={selectAgent}
+        onCreate={createAgent}
         onDeleted={refreshAgents}
       />
       <div className="flex-1 min-w-0">
@@ -84,7 +109,7 @@ export default function Home() {
           snap={snap}
           onSaved={refreshAgents}
         />
-        <PositionDriftBanner snap={snap} />
+        <PositionDriftBanner snap={snap} cfg={cfg} />
         <div className="px-6 pb-8 max-w-7xl mx-auto">
           <AccordionStack cfg={cfg} setCfg={setCfg} snap={snap} />
         </div>
@@ -94,37 +119,40 @@ export default function Home() {
 }
 
 /* ===================================================================
-   SIDEBAR — saved-agent list. Click Edit to load a config back into
-   the form (rename, tweak, then Start). Click ✕ to delete. The
-   currently-running agent is marked ACTIVE; everything else INACTIVE.
+   SIDEBAR — collapsible Active / Inactive sections + Create Agent.
+   - "+ Create Agent" → opens the form with a fresh template (no name
+     yet); the user types a name and clicks Save or Start.
+   - Active section lists every RUNNING agent; click to view its live
+     data (snapshot, baskets, orders).
+   - Inactive section lists every saved-but-not-running config; click
+     to load its config into the form (edit & restart).
    =================================================================== */
 function AgentsSidebar({
   agents,
-  activeName,
   currentName,
-  running,
-  onEdit,
+  onSelect,
+  onCreate,
   onDeleted,
 }: {
   agents: AgentList;
-  activeName: string | null;
   currentName: string;
-  running: boolean;
-  onEdit: (cfg: AgentConfig) => void;
+  onSelect: (a: AgentConfig) => void;
+  onCreate: () => void | Promise<void>;
   onDeleted: () => void | Promise<void>;
 }) {
-  // Sort: ACTIVE agent first (pinned to the top), then the rest in their
-  // original (load) order. Stable secondary sort keeps the inactive list
-  // from shuffling tick-to-tick.
-  const list = useMemo(() => {
-    const arr = [...agents.agents];
-    arr.sort((a, b) => {
-      const aActive = activeName === a.name ? 0 : 1;
-      const bActive = activeName === b.name ? 0 : 1;
-      return aActive - bActive;
-    });
-    return arr;
-  }, [agents.agents, activeName]);
+  const activeSet = useMemo(() => new Set(agents.active), [agents.active]);
+  const active = useMemo(
+    () => agents.agents.filter((a) => activeSet.has(a.name)),
+    [agents.agents, activeSet]
+  );
+  const inactive = useMemo(
+    () => agents.agents.filter((a) => !activeSet.has(a.name)),
+    [agents.agents, activeSet]
+  );
+
+  const [activeOpen, setActiveOpen] = useState(true);
+  const [inactiveOpen, setInactiveOpen] = useState(true);
+
   return (
     <aside className="w-64 shrink-0 border-r border-edge bg-slate-50 min-h-screen sticky top-0 self-start max-h-screen overflow-y-auto">
       <div className="px-4 py-4 border-b border-edge">
@@ -132,109 +160,172 @@ function AgentsSidebar({
           Agents
         </h2>
         <p className="text-[11px] text-muted mt-1">
-          {list.length} saved · {activeName ? "1 running" : "none running"}
+          {agents.agents.length} saved · {active.length} running
         </p>
+        <button
+          className="mt-3 w-full text-xs font-bold px-2 py-1.5 rounded bg-accent text-white hover:opacity-90"
+          onClick={onCreate}
+        >
+          + Create Agent
+        </button>
       </div>
-      {list.length === 0 ? (
-        <div className="px-4 py-6 text-xs text-muted">
-          No saved agents yet. Configure one in the form and click Save (or
-          Start — saves automatically).
-        </div>
-      ) : (
-        <ul className="py-2">
-          {list.map((a, idx) => {
-            const isActive = activeName === a.name;
-            const isEditing = currentName === a.name;
-            // Show an "Inactive" divider once we transition past the
-            // active agent (which is pinned at the top). Only rendered
-            // if there IS an active agent AND there's at least one
-            // inactive one below it.
-            const prev = idx > 0 ? list[idx - 1] : null;
-            const showInactiveDivider =
-              !!activeName &&
-              !!prev &&
-              activeName === prev.name &&
-              !isActive;
-            return (
-              <React.Fragment key={a.name}>
-                {showInactiveDivider && (
-                  <li className="px-3 pt-3 pb-1 text-[10px] uppercase tracking-widest text-muted">
-                    Inactive
-                  </li>
-                )}
-              <li
-                className={`px-3 py-2 mx-2 mb-1 rounded border ${
-                  isActive
-                    ? "border-good bg-emerald-50"
-                    : isEditing
-                    ? "border-blue-300 bg-blue-50"
-                    : "border-edge bg-white"
-                }`}
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <span className="font-bold text-sm truncate" title={a.name}>
-                    {a.name}
-                  </span>
-                  <span
-                    className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${
-                      isActive
-                        ? "bg-good text-white"
-                        : "bg-slate-200 text-slate-600"
-                    }`}
-                  >
-                    {isActive ? "ACTIVE" : "INACTIVE"}
-                  </span>
-                </div>
-                <div className="text-[11px] text-muted font-mono mt-0.5">
-                  {a.trading.exchange} · {a.trading.token}
-                </div>
-                <div className="text-[10px] text-muted font-mono leading-snug mt-1">
-                  step {a.trading.grid_step} · spread {a.trading.tp_spread} ·
-                  depth {a.trading.grid_depth}
-                  <br />
-                  qty {a.trading.per_step_qty} · {a.basket.num_baskets}{" "}
-                  basket{a.basket.num_baskets === 1 ? "" : "s"}
-                </div>
-                <div className="flex justify-end gap-1 mt-2">
-                  <button
-                    className="text-[10px] px-2 py-0.5 rounded border border-edge bg-white hover:bg-slate-100 disabled:opacity-50"
-                    disabled={isEditing && !running}
-                    title={
-                      running
-                        ? "Stop the running agent first to edit its config in the form"
-                        : "Load this config into the form so you can edit it"
-                    }
-                    onClick={() => onEdit({ ...a })}
-                  >
-                    ✎ Edit
-                  </button>
-                  <button
-                    className="text-[10px] px-2 py-0.5 rounded border border-edge bg-white hover:bg-rose-50 text-danger disabled:opacity-50"
-                    disabled={isActive}
-                    title={
-                      isActive
-                        ? "Cannot delete the currently running agent"
-                        : "Remove this saved agent"
-                    }
-                    onClick={async () => {
-                      if (
-                        window.confirm(`Delete saved agent "${a.name}"?`)
-                      ) {
-                        await deleteAgent(a.name);
-                        await onDeleted();
-                      }
-                    }}
-                  >
-                    ✕
-                  </button>
-                </div>
-              </li>
-              </React.Fragment>
-            );
-          })}
+
+      <SidebarSection
+        label="Active"
+        count={active.length}
+        open={activeOpen}
+        onToggle={() => setActiveOpen((v) => !v)}
+        emptyHint="No bots running."
+        items={active}
+        renderItem={(a) => (
+          <AgentItem
+            key={a.name}
+            a={a}
+            isActive
+            isSelected={currentName === a.name}
+            onSelect={onSelect}
+            onDeleted={onDeleted}
+          />
+        )}
+      />
+
+      <SidebarSection
+        label="Inactive"
+        count={inactive.length}
+        open={inactiveOpen}
+        onToggle={() => setInactiveOpen((v) => !v)}
+        emptyHint="No saved configs yet."
+        items={inactive}
+        renderItem={(a) => (
+          <AgentItem
+            key={a.name}
+            a={a}
+            isActive={false}
+            isSelected={currentName === a.name}
+            onSelect={onSelect}
+            onDeleted={onDeleted}
+          />
+        )}
+      />
+    </aside>
+  );
+}
+
+function SidebarSection({
+  label,
+  count,
+  open,
+  onToggle,
+  emptyHint,
+  items,
+  renderItem,
+}: {
+  label: string;
+  count: number;
+  open: boolean;
+  onToggle: () => void;
+  emptyHint: string;
+  items: AgentConfig[];
+  renderItem: (a: AgentConfig) => React.ReactNode;
+}) {
+  return (
+    <div>
+      <button
+        type="button"
+        className="w-full flex items-center justify-between px-4 py-2 text-[11px] uppercase tracking-widest text-muted hover:bg-slate-100"
+        onClick={onToggle}
+      >
+        <span className="font-bold">
+          {label} <span className="text-slate-400">({count})</span>
+        </span>
+        <span className="text-slate-400">{open ? "▾" : "▸"}</span>
+      </button>
+      {open && (
+        <ul className="py-1">
+          {items.length === 0 ? (
+            <li className="px-4 py-2 text-[11px] text-slate-400 italic">
+              {emptyHint}
+            </li>
+          ) : (
+            items.map((a) => renderItem(a))
+          )}
         </ul>
       )}
-    </aside>
+    </div>
+  );
+}
+
+function AgentItem({
+  a,
+  isActive,
+  isSelected,
+  onSelect,
+  onDeleted,
+}: {
+  a: AgentConfig;
+  isActive: boolean;
+  isSelected: boolean;
+  onSelect: (a: AgentConfig) => void;
+  onDeleted: () => void | Promise<void>;
+}) {
+  return (
+    <li
+      className={`px-3 py-2 mx-2 mb-1 rounded border cursor-pointer hover:shadow-sm ${
+        isSelected
+          ? isActive
+            ? "border-good bg-emerald-100"
+            : "border-blue-300 bg-blue-50"
+          : isActive
+          ? "border-good bg-emerald-50"
+          : "border-edge bg-white"
+      }`}
+      onClick={() => onSelect({ ...a })}
+      title={
+        isActive
+          ? "Click to view this running bot's data"
+          : "Click to load this config into the form"
+      }
+    >
+      <div className="flex items-center justify-between gap-2">
+        <span className="font-bold text-sm truncate" title={a.name}>
+          {a.name}
+        </span>
+        <span
+          className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${
+            isActive ? "bg-good text-white" : "bg-slate-200 text-slate-600"
+          }`}
+        >
+          {isActive ? "ACTIVE" : "INACTIVE"}
+        </span>
+      </div>
+      <div className="text-[11px] text-muted font-mono mt-0.5">
+        {a.trading.exchange} · {a.trading.token}
+      </div>
+      <div className="text-[10px] text-muted font-mono leading-snug mt-1">
+        step {a.trading.grid_step} · spread {a.trading.tp_spread} · depth{" "}
+        {a.trading.grid_depth}
+        <br />
+        qty {a.trading.per_step_qty} · {a.basket.num_baskets}{" "}
+        basket{a.basket.num_baskets === 1 ? "" : "s"}
+      </div>
+      {!isActive && (
+        <div className="flex justify-end gap-1 mt-2">
+          <button
+            className="text-[10px] px-2 py-0.5 rounded border border-edge bg-white hover:bg-rose-50 text-danger"
+            title="Remove this saved config"
+            onClick={async (e) => {
+              e.stopPropagation();
+              if (window.confirm(`Delete saved agent "${a.name}"?`)) {
+                await deleteAgent(a.name);
+                await onDeleted();
+              }
+            }}
+          >
+            ✕ Delete
+          </button>
+        </div>
+      )}
+    </li>
   );
 }
 
@@ -316,22 +407,25 @@ function TopBar({
           </button>
           <button
             className="btn btn-ghost"
-            disabled={!running}
-            onClick={stopEngine}
+            disabled={!running || !cfg.name?.trim()}
+            onClick={async () => {
+              await stopEngine(cfg.name);
+              await onSaved();
+            }}
           >
             ■ Stop
           </button>
           <button
             className="btn btn-danger"
-            disabled={!running || tripped}
-            onClick={killSwitch}
+            disabled={!running || tripped || !cfg.name?.trim()}
+            onClick={() => killSwitch(cfg.name)}
           >
             ⚠ Kill
           </button>
           <button
             className="btn btn-ghost"
-            disabled={!tripped}
-            onClick={resetKillSwitch}
+            disabled={!tripped || !cfg.name?.trim()}
+            onClick={() => resetKillSwitch(cfg.name)}
           >
             Reset
           </button>
@@ -344,10 +438,16 @@ function TopBar({
 /// Persistent red banner shown across the whole page whenever the bot's
 /// bookkeeping doesn't match the exchange's actual position. Tolerance of
 /// 0.5 unit covers floating-point noise. Big drifts indicate a missed fill.
-function PositionDriftBanner({ snap }: { snap: Snapshot | null }) {
+function PositionDriftBanner({
+  snap,
+  cfg,
+}: {
+  snap: Snapshot | null;
+  cfg: AgentConfig | null;
+}) {
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<string | null>(null);
-  if (!snap) return null;
+  if (!snap || !cfg?.name) return null;
   const drift = snap.position_drift ?? 0;
   if (drift <= 0.5) return null;
 
@@ -361,7 +461,7 @@ function PositionDriftBanner({ snap }: { snap: Snapshot | null }) {
       return;
     setBusy(true);
     setResult(null);
-    const r = await forceFlatten();
+    const r = await forceFlatten(cfg.name);
     setBusy(false);
     setResult(r.message);
   };

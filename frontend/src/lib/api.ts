@@ -3,6 +3,9 @@ const BASE = process.env.NEXT_PUBLIC_API || "http://localhost:8080";
 export type AgentConfig = {
   /** Human-friendly identifier so the user can save & reload configs. */
   name: string;
+  /** Epoch ms — set every time the agent is started. UI sorts the
+   *  Inactive sidebar list by this descending (most recent first). */
+  last_active_at?: number;
   trading: {
     token: string;
     exchange: "binance" | "deribit" | "hyperliquid" | "mock";
@@ -324,6 +327,48 @@ export async function saveAgent(cfg: AgentConfig) {
     return await safeJson(r);
   } catch (e: any) {
     return { error: e?.message ?? "save failed" };
+  }
+}
+
+/* ===================================================================
+   24h SUMMARY — read-only aggregation across every agent's history.
+   =================================================================== */
+export type SummaryRow = {
+  exchange: string;
+  token: string;
+  agents: string[];
+  rtp_count: number;
+  /** gross_pnl / rtp_count — average realised profit per round trip. */
+  per_rtp_pnl: number;
+  gross_pnl: number;
+  fees: number;
+  /** Sum of NEGATIVE fees recorded → exchange-paid maker rebates. */
+  rebates: number;
+  /** gross_pnl − fees + rebates + basket_hit_pnl */
+  net_pnl: number;
+  /** Sum of buy + sell USD notional traded inside the window. */
+  volume: number;
+  basket_hits: number;
+  basket_hit_pnl: number;
+};
+
+export type SummaryReport = {
+  hours: number;
+  rows: SummaryRow[];
+};
+
+export async function getSummary(hours: number = 24): Promise<SummaryReport> {
+  try {
+    const r = await fetch(`${BASE}/api/summary?hours=${hours}`, {
+      cache: "no-store",
+    });
+    const j = await safeJson(r);
+    return {
+      hours: j?.hours ?? hours,
+      rows: Array.isArray(j?.rows) ? j.rows : [],
+    };
+  } catch {
+    return { hours, rows: [] };
   }
 }
 

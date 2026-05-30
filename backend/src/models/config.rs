@@ -97,6 +97,11 @@ pub struct AgentConfig {
     /// name field.
     #[serde(default = "default_agent_name")]
     pub name: String,
+    /// Unix epoch milliseconds — set every time the agent is started.
+    /// The frontend sorts the Inactive sidebar list by this descending
+    /// so the most-recently-used config appears first. 0 = never run.
+    #[serde(default)]
+    pub last_active_at: i64,
     pub trading: TradingConfig,
     pub basket: BasketConfig,
     pub kill_switch: KillSwitchConfig,
@@ -111,6 +116,7 @@ impl AgentConfig {
     pub fn default_demo() -> Self {
         Self {
             name: "Demo Agent".into(),
+            last_active_at: 0,
             trading: TradingConfig {
                 token: "BTC-USDT".into(),
                 exchange: Exchange::Mock,

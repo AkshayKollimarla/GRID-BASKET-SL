@@ -99,7 +99,10 @@ impl TradeTracker {
         }
     }
 
-    pub fn ingest(&self, fill: &Fill) {
+    /// Process a fill and return any new RoundTrips created as a result.
+    /// Caller (engine) persists those to the per-agent history log so
+    /// the 24h summary can include round trips even after the bot stops.
+    pub fn ingest(&self, fill: &Fill) -> Vec<RoundTrip> {
         let mut s = self.state.lock();
         s.total_fills += 1;
         s.total_fees += fill.fee.max(0.0);
@@ -148,7 +151,7 @@ impl TradeTracker {
                 fee_per_unit,
                 time: fill.timestamp,
             });
-            return;
+            return Vec::new();
         }
 
         // Closing fill — pair FIFO against this basket's open lots.
@@ -262,7 +265,8 @@ impl TradeTracker {
         s.sl_pnl += sl_pnl_delta;
         s.rtp_count += rtp_count_delta;
         s.sl_count += sl_count_delta;
-        s.round_trips.extend(new_rtps);
+        s.round_trips.extend(new_rtps.clone());
+        new_rtps
     }
 
     pub fn stats(&self, now_ms: i64) -> TradeStats {

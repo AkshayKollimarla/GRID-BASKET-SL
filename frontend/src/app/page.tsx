@@ -16,7 +16,10 @@ import {
   listAgents,
   saveAgent,
   deleteAgent,
+  getSummary,
   AgentList,
+  SummaryReport,
+  SummaryRow,
 } from "@/lib/api";
 
 /* ===================================================================
@@ -29,6 +32,7 @@ export default function Home() {
   const [cfg, setCfg] = useState<AgentConfig | null>(null);
   const [snap, setSnap] = useState<Snapshot | null>(null);
   const [agents, setAgents] = useState<AgentList>({ agents: [], active: [] });
+  const [summary, setSummary] = useState<SummaryReport>({ hours: 24, rows: [] });
   const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
@@ -72,6 +76,21 @@ export default function Home() {
     };
   }, []);
 
+  // Poll the 24h summary. Cheaper than snapshot, so every 5s is plenty.
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = async () => {
+      const s = await getSummary(24);
+      if (!cancelled) setSummary(s);
+    };
+    refresh();
+    const t = setInterval(refresh, 5000);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
+  }, []);
+
   if (err) return <ErrorBox msg={err} />;
   if (!cfg) return <Loading />;
 
@@ -99,6 +118,7 @@ export default function Home() {
       <AgentsSidebar
         agents={agents}
         currentName={cfg.name}
+        summary={summary}
         onSelect={selectAgent}
         onCreate={createAgent}
         onDeleted={refreshAgents}
@@ -130,12 +150,14 @@ export default function Home() {
 function AgentsSidebar({
   agents,
   currentName,
+  summary,
   onSelect,
   onCreate,
   onDeleted,
 }: {
   agents: AgentList;
   currentName: string;
+  summary: SummaryReport;
   onSelect: (a: AgentConfig) => void;
   onCreate: () => void | Promise<void>;
   onDeleted: () => void | Promise<void>;
@@ -145,13 +167,18 @@ function AgentsSidebar({
     () => agents.agents.filter((a) => activeSet.has(a.name)),
     [agents.agents, activeSet]
   );
-  const inactive = useMemo(
-    () => agents.agents.filter((a) => !activeSet.has(a.name)),
-    [agents.agents, activeSet]
-  );
+  // Inactive list sorted by `last_active_at` descending — most recently
+  // used config appears first. Missing/zero timestamps fall to the
+  // bottom (treated as "never run").
+  const inactive = useMemo(() => {
+    const arr = agents.agents.filter((a) => !activeSet.has(a.name));
+    arr.sort((a, b) => (b.last_active_at ?? 0) - (a.last_active_at ?? 0));
+    return arr;
+  }, [agents.agents, activeSet]);
 
   const [activeOpen, setActiveOpen] = useState(true);
   const [inactiveOpen, setInactiveOpen] = useState(true);
+  const [summaryOpen, setSummaryOpen] = useState(true);
 
   return (
     <aside className="w-64 shrink-0 border-r border-edge bg-slate-50 min-h-screen sticky top-0 self-start max-h-screen overflow-y-auto">
@@ -207,8 +234,138 @@ function AgentsSidebar({
           />
         )}
       />
+
+      <SummarySection
+        summary={summary}
+        open={summaryOpen}
+        onToggle={() => setSummaryOpen((v) => !v)}
+      />
     </aside>
   );
+}
+
+/* ===================================================================
+   24h SUMMARY — one row per (exchange, token), aggregated across
+   every agent (including stopped ones that traded inside the window).
+   =================================================================== */
+function SummarySection({
+  summary,
+  open,
+  onToggle,
+}: {
+  summary: SummaryReport;
+  open: boolean;
+  onToggle: () => void;
+}) {
+  const total = summary.rows.length;
+  return (
+    <div className="border-t border-edge mt-2">
+      <button
+        type="button"
+        className="w-full flex items-center justify-between px-4 py-2 text-[11px] uppercase tracking-widest text-muted hover:bg-slate-100"
+        onClick={onToggle}
+      >
+        <span className="font-bold">
+          {summary.hours}h Summary{" "}
+          <span className="text-slate-400">({total})</span>
+        </span>
+        <span className="text-slate-400">{open ? "▾" : "▸"}</span>
+      </button>
+      {open && (
+        <div className="px-2 pb-3 pt-1 space-y-2">
+          {summary.rows.length === 0 ? (
+            <div className="px-2 py-2 text-[11px] text-slate-400 italic">
+              No fills inside the {summary.hours}h window yet.
+            </div>
+          ) : (
+            summary.rows.map((r) => (
+              <SummaryRowCard key={`${r.exchange}:${r.token}`} r={r} />
+            ))
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SummaryRowCard({ r }: { r: SummaryRow }) {
+  const netCls =
+    r.net_pnl > 0
+      ? "text-good font-bold"
+      : r.net_pnl < 0
+      ? "text-danger font-bold"
+      : "text-ink/80 font-bold";
+  return (
+    <div className="rounded border border-edge bg-white px-2 py-2">
+      <div className="flex items-center justify-between gap-1">
+        <span className="font-bold text-xs truncate" title={r.token}>
+          {r.token}
+        </span>
+        <span className="text-[9px] uppercase tracking-wider text-muted">
+          {r.exchange}
+        </span>
+      </div>
+      <div className="text-[10px] text-muted font-mono mt-0.5 truncate" title={r.agents.join(", ")}>
+        {r.agents.length} bot{r.agents.length === 1 ? "" : "s"}
+        {r.agents.length > 0 && ` · ${r.agents.join(", ")}`}
+      </div>
+      <div className="mt-1.5 grid grid-cols-2 gap-x-2 gap-y-0.5 text-[10px] font-mono leading-snug">
+        <SumKV k="RTPs" v={r.rtp_count.toString()} />
+        <SumKV k="per-RTP" v={fmtMoney(r.per_rtp_pnl, 4)} />
+        <SumKV k="Gross" v={fmtMoney(r.gross_pnl)} />
+        <SumKV k="Fees" v={fmtMoney(r.fees)} />
+        {r.rebates > 0 && <SumKV k="Rebates" v={fmtMoney(r.rebates)} />}
+        <SumKV k="Volume" v={fmtMoney(r.volume, 0)} />
+        <SumKV k="Hits" v={r.basket_hits.toString()} />
+        {r.basket_hits > 0 && (
+          <SumKV k="Hit PnL" v={fmtMoney(r.basket_hit_pnl)} />
+        )}
+      </div>
+      <div className="flex items-baseline justify-between border-t border-edge mt-1.5 pt-1">
+        <span className="text-[10px] uppercase tracking-wider text-muted">
+          Net PnL
+        </span>
+        <span className={`text-sm ${netCls} tabular-nums`}>
+          {fmtMoney(r.net_pnl)}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function SumKV({ k, v }: { k: string; v: string }) {
+  return (
+    <>
+      <span className="text-muted">{k}</span>
+      <span className="text-right tabular-nums">{v}</span>
+    </>
+  );
+}
+
+function fmtMoney(n: number, dp: number = 2): string {
+  const sign = n < 0 ? "−" : "";
+  const a = Math.abs(n);
+  if (a >= 1_000_000) return `${sign}$${(a / 1_000_000).toFixed(2)}M`;
+  if (a >= 1_000 && dp <= 2) return `${sign}$${(a / 1_000).toFixed(2)}k`;
+  return `${sign}$${a.toFixed(dp)}`;
+}
+
+/** "just now", "5m ago", "2h ago", "3d ago" — coarse human-readable
+ *  relative timestamp. Used on inactive-agent cards to show recency. */
+function formatRelativeAgo(epochMs: number): string {
+  const diff = Date.now() - epochMs;
+  if (diff < 0) return "just now";
+  const sec = Math.floor(diff / 1000);
+  if (sec < 60) return "just now";
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  const day = Math.floor(hr / 24);
+  if (day < 30) return `${day}d ago`;
+  const mon = Math.floor(day / 30);
+  if (mon < 12) return `${mon}mo ago`;
+  return `${Math.floor(mon / 12)}y ago`;
 }
 
 function SidebarSection({
@@ -308,6 +465,14 @@ function AgentItem({
         qty {a.trading.per_step_qty} · {a.basket.num_baskets}{" "}
         basket{a.basket.num_baskets === 1 ? "" : "s"}
       </div>
+      {!isActive && a.last_active_at && a.last_active_at > 0 && (
+        <div
+          className="text-[10px] text-slate-400 font-mono mt-1"
+          title={new Date(a.last_active_at).toLocaleString()}
+        >
+          last active {formatRelativeAgo(a.last_active_at)}
+        </div>
+      )}
       {!isActive && (
         <div className="flex justify-end gap-1 mt-2">
           <button

@@ -256,6 +256,12 @@ impl GridEngine {
             if price <= mid + eps {
                 continue;
             }
+            // Don't place an order the cancel rule would immediately kill —
+            // that loop produced the 2014 cancel/replace storm. Step out
+            // of the loop entirely (subsequent k values are even farther).
+            if (price - active_anchor).abs() > far_threshold {
+                break;
+            }
             if price > cycle_upper {
                 continue;
             }
@@ -296,6 +302,11 @@ impl GridEngine {
             // Sanity guard: never place on or above mid (would be a taker).
             if price >= mid - eps {
                 continue;
+            }
+            // Same far_threshold guard as the sell side — don't place
+            // orders the cancel rule will immediately kill.
+            if (price - active_anchor).abs() > far_threshold {
+                break;
             }
             if price < cycle_lower {
                 continue;

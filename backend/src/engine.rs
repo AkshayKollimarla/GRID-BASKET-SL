@@ -63,6 +63,35 @@ pub struct EngineSnapshot {
     pub parked_tp_count: usize,
 }
 
+/// One persisted history event — appended to `history/<agent>.jsonl`
+/// as round trips and basket-SL kills happen. The 24h Summary endpoint
+/// reads these files, filters by `ts`, and aggregates by
+/// (exchange, token).
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct HistoryEvent {
+    /// `rtp` or `basket_hit`.
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// Unix epoch milliseconds.
+    pub ts: i64,
+    pub agent: String,
+    pub exchange: String,
+    pub token: String,
+    /// Gross PnL for RTPs (signed); for basket_hit = realized PnL delta
+    /// at the moment the basket was killed (usually negative).
+    pub gross_pnl: f64,
+    /// Total fees paid on this event (sum of entry + exit for RTPs).
+    /// Can be negative if the exchange paid a maker rebate.
+    pub fees: f64,
+    /// USD volume traded on this event. For an RTP we record
+    /// `2 × one_leg_notional` so the summary "buy+sell volume" is
+    /// directly summable. For basket_hit = the qty closed × exit price.
+    pub volume: f64,
+    /// Round-trip qty (one leg) or basket-hit closed qty.
+    pub qty: f64,
+    pub basket_index: u32,
+}
+
 pub struct EngineHandle {
     pub config: AgentConfig,
     pub basket_mgr: Arc<BasketManager>,
@@ -412,6 +441,102 @@ impl EngineHandle {
         }
     }
 
+    /// Sanitize an agent name for use as a filename. Whitespace becomes
+    /// '_', and only ASCII alphanumerics + a few safe punctuation
+    /// characters survive. Empty result falls back to "agent".
+    fn history_filename(name: &str) -> String {
+        let mut s = String::new();
+        for ch in name.chars() {
+            if ch.is_ascii_alphanumeric() {
+                s.push(ch);
+            } else if ch.is_whitespace() {
+                s.push('_');
+            } else if matches!(ch, '-' | '_' | '.') {
+                s.push(ch);
+            }
+        }
+        if s.is_empty() {
+            s.push_str("agent");
+        }
+        format!("{}.jsonl", s)
+    }
+
+    /// Append one history event to `history/<sanitized agent name>.jsonl`.
+    /// Best-effort: I/O errors are logged at WARN and the engine keeps
+    /// going (we never want the disk to take down the trading loop).
+    async fn append_history(&self, ev: HistoryEvent) {
+        let _ = tokio::fs::create_dir_all("history").await;
+        let path = format!("history/{}", Self::history_filename(&self.config.name));
+        let line = match serde_json::to_string(&ev) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(?e, "could not serialize history event");
+                return;
+            }
+        };
+        match tokio::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&path)
+            .await
+        {
+            Ok(mut f) => {
+                use tokio::io::AsyncWriteExt;
+                let payload = format!("{}\n", line);
+                if let Err(e) = f.write_all(payload.as_bytes()).await {
+                    tracing::warn!(?e, ?path, "history write failed");
+                }
+            }
+            Err(e) => tracing::warn!(?e, ?path, "history open failed"),
+        }
+    }
+
+    /// Persist one round trip. Called from process_fill right after
+    /// trade_tracker.ingest returns the new RTPs.
+    pub async fn record_rtp(&self, rt: &RoundTrip) {
+        let ev = HistoryEvent {
+            kind: if rt.is_take_profit { "rtp" } else { "sl_rtp" }.into(),
+            ts: rt.exit_time,
+            agent: self.config.name.clone(),
+            exchange: format!("{:?}", self.config.trading.exchange).to_lowercase(),
+            token: self.config.trading.token.clone(),
+            gross_pnl: rt.gross_pnl,
+            fees: rt.fees,
+            // For "buy+sell volume" math, an RTP is one buy leg + one sell
+            // leg of equal qty → double the one-leg notional that
+            // trade_tracker recorded.
+            volume: rt.volume * 2.0,
+            qty: rt.qty,
+            basket_index: rt.basket_index,
+        };
+        self.append_history(ev).await;
+    }
+
+    /// Persist one basket-hit event. Called from check_basket_boundaries
+    /// right after a basket is killed by its own SL. `pnl_delta` is the
+    /// realized-PnL change booked by `kill()` (usually negative).
+    pub async fn record_basket_hit(
+        &self,
+        basket_index: u32,
+        qty_closed: f64,
+        exit_price: f64,
+        pnl_delta: f64,
+    ) {
+        let ev = HistoryEvent {
+            kind: "basket_hit".into(),
+            ts: chrono::Utc::now().timestamp_millis(),
+            agent: self.config.name.clone(),
+            exchange: format!("{:?}", self.config.trading.exchange).to_lowercase(),
+            token: self.config.trading.token.clone(),
+            gross_pnl: pnl_delta,
+            fees: 0.0,
+            volume: qty_closed * exit_price.max(0.0),
+            qty: qty_closed,
+            basket_index,
+        };
+        self.append_history(ev).await;
+    }
+
     pub async fn snapshot(&self) -> EngineSnapshot {
         // Do all awaits BEFORE taking any parking_lot guards.
         let open_orders = self.exchange.open_orders().await;
@@ -661,8 +786,13 @@ pub fn spawn_engine(handle: Arc<EngineHandle>, mut fills_rx: broadcast::Receiver
 
 async fn process_fill(h: &EngineHandle, fill: Fill) {
     // First, feed the trade tracker so cumulative stats + round-trip pairing
-    // include this fill before anything else acts on it.
-    h.trade_tracker.ingest(&fill);
+    // include this fill before anything else acts on it. Any new round
+    // trips created by this fill are returned so we can persist them to
+    // the agent's per-coin history log for the 24h summary.
+    let new_rtps = h.trade_tracker.ingest(&fill);
+    for rt in &new_rtps {
+        h.record_rtp(rt).await;
+    }
     {
         let mut g = h.recent_fills.write();
         g.push(fill.clone());
@@ -732,28 +862,22 @@ async fn process_fill(h: &EngineHandle, fill: Fill) {
                 return;
             }
 
-            // ── 3a. Dedup check: don't place a TP that already exists.
-            //       If this basket already has a TP order resting at (or very
-            //       close to) the same price, skip placement. This prevents
-            //       duplicate TPs at the same price level from showing up on
-            //       the exchange when an entry fill triggers TP placement
-            //       twice (e.g., due to a race or retry).
+            // ── 3a. Multiple entries at the SAME price are legitimate —
+            //       the grid refills slots after each fill, so two
+            //       successive fills at 2016.50 each need their own
+            //       coverage TP at 2016.00. The previous version of
+            //       this code de-duped them and dropped the 2nd TP,
+            //       leaving the position uncovered. Now we always
+            //       place a TP per entry fill; Deribit accepts multiple
+            //       orders at the same price, and the depth budget +
+            //       parking logic below handles overflow correctly.
+            //
+            //       Race-condition protection (same fill processed twice)
+            //       is already guaranteed by deribit.rs's
+            //       `processed_trade_ids` dedup, so we don't need a
+            //       second layer here.
             let depth = h.config.trading.grid_depth.max(1) as usize;
             let open = h.exchange.open_orders().await;
-            let tick_tolerance = 0.5_f64; // Deribit BTC-PERP tick
-            let already_has_tp = open.iter().any(|o| {
-                o.basket_id == fill.basket_id
-                    && matches!(o.purpose, OrderPurpose::TakeProfit)
-                    && o.side == tp_side
-                    && (o.price - tp_price).abs() < tick_tolerance
-            });
-            if already_has_tp {
-                h.log_line(format!(
-                    "  TP @ {:.2} for basket#{} already exists — skipping duplicate",
-                    tp_price, basket_idx
-                ));
-                return;
-            }
 
             // ── 3b. Make room: if target side already has `depth` orders,
             //       cancel the FURTHEST ENTRY on that side first (entries
@@ -972,9 +1096,24 @@ async fn check_basket_boundaries(h: &EngineHandle) {
             mid
         };
 
+        let pnl_before = h
+            .basket_mgr
+            .baskets
+            .get(&bid)
+            .map(|b| b.realized_pnl)
+            .unwrap_or(0.0);
         if let Some(mut b) = h.basket_mgr.baskets.get_mut(&bid) {
             b.kill(exit_px);
         }
+        let pnl_after = h
+            .basket_mgr
+            .baskets
+            .get(&bid)
+            .map(|b| b.realized_pnl)
+            .unwrap_or(pnl_before);
+        let pnl_delta = pnl_after - pnl_before;
+        h.record_basket_hit(idx, net_qty.abs(), exit_px, pnl_delta).await;
+
         // Drop any TPs still parked for this basket — the position is
         // gone, so the saved closing orders would re-open positions if
         // they ever un-parked.

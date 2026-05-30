@@ -777,13 +777,43 @@ impl Exchange for DeribitClient {
                     // may have just filled — the trade feed will catch up
                     // within a few seconds, and the lookup fallback can
                     // still match the fill to the right basket/purpose.
+                    //
+                    // FRESHNESS GUARD: skip orders younger than 3 seconds.
+                    // The Deribit get_open_orders response we're checking
+                    // against was sent BEFORE our latest place_maker_only
+                    // call could have hit their book; without this guard,
+                    // every fresh placement gets immediately moved to
+                    // recently_cancelled by the next sync, the grid then
+                    // re-places at the same slot, and we get the
+                    // "ETH-122328… every 1.2s" loop the operator saw.
+                    let now_ms = chrono::Utc::now().timestamp_millis();
+                    let min_age_ms = 3_000_i64;
+                    let mut skipped_fresh = 0u32;
                     for id in &our_ids {
-                        if !still_open.contains(id) {
-                            if let Some((_, order)) = self.open_orders.remove(id) {
-                                self.recently_cancelled
-                                    .insert(id.clone(), (order, Instant::now()));
+                        if still_open.contains(id) {
+                            continue;
+                        }
+                        let order_age = self
+                            .open_orders
+                            .get(id)
+                            .map(|e| now_ms - e.value().created_at);
+                        if let Some(age) = order_age {
+                            if age < min_age_ms {
+                                skipped_fresh += 1;
+                                continue;
                             }
                         }
+                        if let Some((_, order)) = self.open_orders.remove(id) {
+                            self.recently_cancelled
+                                .insert(id.clone(), (order, Instant::now()));
+                        }
+                    }
+                    if skipped_fresh > 0 {
+                        tracing::debug!(
+                            skipped_fresh,
+                            min_age_ms,
+                            "sync skipped orders younger than freshness window"
+                        );
                     }
 
                     // ORPHAN OPEN ORDER detection: orders on the exchange

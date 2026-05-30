@@ -108,6 +108,12 @@ pub fn router() -> Router {
         // re-load them into the form, and delete them.
         .route("/api/agents", get(list_agents).post(save_agent))
         .route("/api/agents/:name", delete(delete_agent))
+        // 24h (or arbitrary-hours) summary — reads every per-agent
+        // history file under `history/` and aggregates by (exchange,
+        // token). Includes data from STOPPED bots that traded inside
+        // the window, plus live data from currently running ones (since
+        // both append to the same files).
+        .route("/api/summary", get(summary))
         .with_state(state)
         .layer(cors)
 }
@@ -170,8 +176,10 @@ async fn start(
         );
     }
     // Persist the config (insert or update) so the sidebar shows it.
+    // Stamp `last_active_at` so the UI can sort Inactive by recency.
     let mut to_save = cfg.clone();
     to_save.name = name.clone();
+    to_save.last_active_at = chrono::Utc::now().timestamp_millis();
     upsert_saved(&state, to_save.clone());
 
     match EngineHandle::new(to_save).await {
@@ -330,6 +338,132 @@ async fn delete_agent(
     }
     state.persist();
     (StatusCode::OK, Json(json!({ "status": "deleted", "name": name })))
+}
+
+#[derive(Debug, Deserialize)]
+struct SummaryQuery {
+    hours: Option<u64>,
+}
+
+/// 24h (default) summary endpoint — reads every per-agent history
+/// JSONL file under `history/`, filters by timestamp >= now − hours,
+/// and aggregates by (exchange, token). The frontend sidebar polls
+/// this and renders one row per coin.
+async fn summary(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<SummaryQuery>,
+) -> impl IntoResponse {
+    use std::collections::HashMap;
+    let hours = q.hours.unwrap_or(24).max(1);
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let since_ms = now_ms - (hours as i64) * 3_600_000;
+
+    #[derive(Default)]
+    struct Agg {
+        rtp_count: u64,
+        gross_pnl: f64,
+        fees: f64,
+        rebates: f64,
+        volume: f64,
+        qty: f64,
+        basket_hits: u64,
+        basket_hit_pnl: f64,
+        agents: std::collections::BTreeSet<String>,
+    }
+
+    let mut agg: HashMap<(String, String), Agg> = HashMap::new();
+    let history_dir = std::path::Path::new("history");
+    if let Ok(entries) = std::fs::read_dir(history_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map(|s| s != "jsonl").unwrap_or(true) {
+                continue;
+            }
+            let content = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            for line in content.lines() {
+                let ev: crate::engine::HistoryEvent = match serde_json::from_str(line) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if ev.ts < since_ms {
+                    continue;
+                }
+                let key = (ev.exchange.clone(), ev.token.clone());
+                let s = agg.entry(key).or_default();
+                s.agents.insert(ev.agent.clone());
+                match ev.kind.as_str() {
+                    "rtp" | "sl_rtp" => {
+                        s.rtp_count += 1;
+                        s.gross_pnl += ev.gross_pnl;
+                        // Negative fees are exchange-paid maker rebates.
+                        if ev.fees >= 0.0 {
+                            s.fees += ev.fees;
+                        } else {
+                            s.rebates += -ev.fees;
+                        }
+                        s.volume += ev.volume;
+                        s.qty += ev.qty;
+                    }
+                    "basket_hit" => {
+                        s.basket_hits += 1;
+                        s.basket_hit_pnl += ev.gross_pnl;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let mut rows: Vec<serde_json::Value> = agg
+        .into_iter()
+        .map(|((exchange, token), s)| {
+            let per_rtp_pnl = if s.rtp_count > 0 {
+                s.gross_pnl / s.rtp_count as f64
+            } else {
+                0.0
+            };
+            let net_pnl = s.gross_pnl - s.fees + s.rebates + s.basket_hit_pnl;
+            json!({
+                "exchange": exchange,
+                "token": token,
+                "agents": s.agents.into_iter().collect::<Vec<_>>(),
+                "rtp_count": s.rtp_count,
+                "per_rtp_pnl": per_rtp_pnl,
+                "gross_pnl": s.gross_pnl,
+                "fees": s.fees,
+                "rebates": s.rebates,
+                "net_pnl": net_pnl,
+                "volume": s.volume,
+                "basket_hits": s.basket_hits,
+                "basket_hit_pnl": s.basket_hit_pnl,
+            })
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        let ka = (
+            a["exchange"].as_str().unwrap_or("").to_string(),
+            a["token"].as_str().unwrap_or("").to_string(),
+        );
+        let kb = (
+            b["exchange"].as_str().unwrap_or("").to_string(),
+            b["token"].as_str().unwrap_or("").to_string(),
+        );
+        ka.cmp(&kb)
+    });
+
+    let _ = state; // appstate not needed but kept for signature consistency
+    (
+        StatusCode::OK,
+        Json(json!({
+            "hours": hours,
+            "since_ms": since_ms,
+            "now_ms": now_ms,
+            "rows": rows,
+        })),
+    )
 }
 
 /// Operator-triggered emergency flatten for the named running agent.

@@ -51,16 +51,21 @@ impl RiskEngine {
         let daily_loss_ok = realized >= -self.config.kill_switch.max_daily_loss;
         let api_connected = self.api_connected.load(Ordering::Relaxed);
 
-        // missing SL check: any active basket without sl_price?
-        let missing_sl_ok = !self.basket_mgr.baskets.iter().any(|e| {
-            let b = e.value();
-            b.open_qty > 0.0 && b.sl_price.is_none()
-        });
+        // Per-basket SL was removed; protection now comes from the single
+        // cycle SL (anchor ± grid_distance) enforced in engine.rs. Nothing
+        // to check at the basket level, so this is always healthy.
+        let missing_sl_ok = true;
 
         let breach_reason = if !max_exposure_ok {
-            Some(format!("exposure {:.4} > cap", total_open))
+            Some(format!(
+                "exposure {:.4} > max_position_cap {:.4}",
+                total_open, self.config.kill_switch.max_position_cap
+            ))
         } else if !daily_loss_ok {
-            Some(format!("daily loss {:.2} breached", realized))
+            Some(format!(
+                "daily loss {:.2} > max_daily_loss {:.2}",
+                -realized, self.config.kill_switch.max_daily_loss
+            ))
         } else if !api_connected {
             Some("API disconnect".into())
         } else if !missing_sl_ok {

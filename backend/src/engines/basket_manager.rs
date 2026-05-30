@@ -10,7 +10,7 @@ pub struct BasketManager {
 }
 
 impl BasketManager {
-    pub fn new(config: BasketConfig, is_inverse: bool) -> Self {
+    pub fn new(config: BasketConfig, is_inverse: bool, tp_spread: f64) -> Self {
         let baskets = Arc::new(DashMap::new());
         // Split half long, half short. Odd count → one extra long.
         let n = config.num_baskets;
@@ -21,13 +21,7 @@ impl BasketManager {
             } else {
                 BasketSide::Short
             };
-            let b = Basket::new(
-                i,
-                side,
-                config.basket_size_qty,
-                config.basket_sl_distance,
-                is_inverse,
-            );
+            let b = Basket::new(i, side, config.basket_size_qty, is_inverse, tp_spread);
             baskets.insert(b.basket_id, b);
         }
         Self {

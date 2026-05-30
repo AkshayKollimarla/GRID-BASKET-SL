@@ -12,6 +12,11 @@ import {
   killSwitch,
   resetKillSwitch,
   getSnapshot,
+  forceFlatten,
+  listAgents,
+  saveAgent,
+  deleteAgent,
+  AgentList,
 } from "@/lib/api";
 
 /* ===================================================================
@@ -20,6 +25,7 @@ import {
 export default function Home() {
   const [cfg, setCfg] = useState<AgentConfig | null>(null);
   const [snap, setSnap] = useState<Snapshot | null>(null);
+  const [agents, setAgents] = useState<AgentList>({ agents: [], active: null });
   const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
@@ -33,37 +39,197 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
+    // 250ms polling — sees fills within at most 1 cycle.
     const t = setInterval(async () => {
       const s = await getSnapshot();
       if (s) setSnap(s);
-    }, 500);
+    }, 250);
     return () => clearInterval(t);
+  }, []);
+
+  // Poll the saved-agents list separately and less often — it only
+  // changes on Save/Delete/Start, so 2s is plenty and saves traffic.
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = async () => {
+      const a = await listAgents();
+      if (!cancelled) setAgents(a);
+    };
+    refresh();
+    const t = setInterval(refresh, 2000);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
   }, []);
 
   if (err) return <ErrorBox msg={err} />;
   if (!cfg) return <Loading />;
 
+  const refreshAgents = async () => setAgents(await listAgents());
+
   return (
-    <main className="min-h-screen">
-      <TopBar cfg={cfg} snap={snap} />
-      <div className="px-6 pb-8 max-w-7xl mx-auto">
-        <AccordionStack cfg={cfg} setCfg={setCfg} snap={snap} />
+    <main className="min-h-screen flex">
+      <AgentsSidebar
+        agents={agents}
+        activeName={agents.active}
+        currentName={cfg.name}
+        running={snap?.running ?? false}
+        onEdit={(loaded) => setCfg(loaded)}
+        onDeleted={refreshAgents}
+      />
+      <div className="flex-1 min-w-0">
+        <TopBar
+          cfg={cfg}
+          snap={snap}
+          onSaved={refreshAgents}
+        />
+        <PositionDriftBanner snap={snap} />
+        <div className="px-6 pb-8 max-w-7xl mx-auto">
+          <AccordionStack cfg={cfg} setCfg={setCfg} snap={snap} />
+        </div>
       </div>
     </main>
   );
 }
 
 /* ===================================================================
+   SIDEBAR — saved-agent list. Click Edit to load a config back into
+   the form (rename, tweak, then Start). Click ✕ to delete. The
+   currently-running agent is marked ACTIVE; everything else INACTIVE.
+   =================================================================== */
+function AgentsSidebar({
+  agents,
+  activeName,
+  currentName,
+  running,
+  onEdit,
+  onDeleted,
+}: {
+  agents: AgentList;
+  activeName: string | null;
+  currentName: string;
+  running: boolean;
+  onEdit: (cfg: AgentConfig) => void;
+  onDeleted: () => void | Promise<void>;
+}) {
+  const list = agents.agents;
+  return (
+    <aside className="w-64 shrink-0 border-r border-edge bg-slate-50 min-h-screen sticky top-0 self-start max-h-screen overflow-y-auto">
+      <div className="px-4 py-4 border-b border-edge">
+        <h2 className="font-bold text-sm uppercase tracking-wider text-muted">
+          Agents
+        </h2>
+        <p className="text-[11px] text-muted mt-1">
+          {list.length} saved · {activeName ? "1 running" : "none running"}
+        </p>
+      </div>
+      {list.length === 0 ? (
+        <div className="px-4 py-6 text-xs text-muted">
+          No saved agents yet. Configure one in the form and click Save (or
+          Start — saves automatically).
+        </div>
+      ) : (
+        <ul className="py-2">
+          {list.map((a) => {
+            const isActive = activeName === a.name;
+            const isEditing = currentName === a.name;
+            return (
+              <li
+                key={a.name}
+                className={`px-3 py-2 mx-2 mb-1 rounded border ${
+                  isActive
+                    ? "border-good bg-emerald-50"
+                    : isEditing
+                    ? "border-blue-300 bg-blue-50"
+                    : "border-edge bg-white"
+                }`}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-bold text-sm truncate" title={a.name}>
+                    {a.name}
+                  </span>
+                  <span
+                    className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${
+                      isActive
+                        ? "bg-good text-white"
+                        : "bg-slate-200 text-slate-600"
+                    }`}
+                  >
+                    {isActive ? "ACTIVE" : "INACTIVE"}
+                  </span>
+                </div>
+                <div className="text-[11px] text-muted font-mono mt-0.5">
+                  {a.trading.exchange} · {a.trading.token}
+                </div>
+                <div className="text-[10px] text-muted font-mono leading-snug mt-1">
+                  step {a.trading.grid_step} · spread {a.trading.tp_spread} ·
+                  depth {a.trading.grid_depth}
+                  <br />
+                  qty {a.trading.per_step_qty} · {a.basket.num_baskets}{" "}
+                  basket{a.basket.num_baskets === 1 ? "" : "s"}
+                </div>
+                <div className="flex justify-end gap-1 mt-2">
+                  <button
+                    className="text-[10px] px-2 py-0.5 rounded border border-edge bg-white hover:bg-slate-100 disabled:opacity-50"
+                    disabled={isEditing && !running}
+                    title={
+                      running
+                        ? "Stop the running agent first to edit its config in the form"
+                        : "Load this config into the form so you can edit it"
+                    }
+                    onClick={() => onEdit({ ...a })}
+                  >
+                    ✎ Edit
+                  </button>
+                  <button
+                    className="text-[10px] px-2 py-0.5 rounded border border-edge bg-white hover:bg-rose-50 text-danger disabled:opacity-50"
+                    disabled={isActive}
+                    title={
+                      isActive
+                        ? "Cannot delete the currently running agent"
+                        : "Remove this saved agent"
+                    }
+                    onClick={async () => {
+                      if (
+                        window.confirm(`Delete saved agent "${a.name}"?`)
+                      ) {
+                        await deleteAgent(a.name);
+                        await onDeleted();
+                      }
+                    }}
+                  >
+                    ✕
+                  </button>
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </aside>
+  );
+}
+
+/* ===================================================================
    TOP BAR — status, mid price, action buttons
    =================================================================== */
-function TopBar({ cfg, snap }: { cfg: AgentConfig; snap: Snapshot | null }) {
+function TopBar({
+  cfg,
+  snap,
+  onSaved,
+}: {
+  cfg: AgentConfig;
+  snap: Snapshot | null;
+  onSaved: () => void | Promise<void>;
+}) {
   const running = snap?.running ?? false;
   const tripped = snap?.kill_switch_tripped ?? false;
   return (
     <div className="px-6 py-4 border-b border-edge bg-white">
       <div className="flex items-center justify-between gap-4 flex-wrap">
         <div>
-          <h1>Active Agent</h1>
+          <h1>{cfg.name || "Active Agent"}</h1>
           <p className="text-muted text-xs mt-1">
             {snap?.exchange_name ?? "—"} · {cfg.trading.token}
           </p>
@@ -98,9 +264,26 @@ function TopBar({ cfg, snap }: { cfg: AgentConfig; snap: Snapshot | null }) {
             </div>
           )}
           <button
+            className="btn btn-ghost"
+            disabled={!cfg.name?.trim()}
+            title="Save this config to the sidebar (works while running too)"
+            onClick={async () => {
+              const r = await saveAgent(cfg);
+              if (r?.error) {
+                window.alert(`Save failed: ${r.error}`);
+              }
+              await onSaved();
+            }}
+          >
+            ⤓ Save
+          </button>
+          <button
             className="btn btn-primary"
             disabled={running}
-            onClick={() => startEngine(cfg)}
+            onClick={async () => {
+              await startEngine(cfg);
+              await onSaved();
+            }}
           >
             ▶ Start
           </button>
@@ -126,6 +309,76 @@ function TopBar({ cfg, snap }: { cfg: AgentConfig; snap: Snapshot | null }) {
             Reset
           </button>
         </div>
+      </div>
+    </div>
+  );
+}
+
+/// Persistent red banner shown across the whole page whenever the bot's
+/// bookkeeping doesn't match the exchange's actual position. Tolerance of
+/// 0.5 unit covers floating-point noise. Big drifts indicate a missed fill.
+function PositionDriftBanner({ snap }: { snap: Snapshot | null }) {
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<string | null>(null);
+  if (!snap) return null;
+  const drift = snap.position_drift ?? 0;
+  if (drift <= 0.5) return null;
+
+  const onForceFlatten = async () => {
+    if (busy) return;
+    if (
+      !window.confirm(
+        "Emergency flatten?\n\nThis will:\n  1. Cancel every resting order\n  2. Slice every basket flat at market\n  3. Mop up any residual exchange position\n  4. Verify the exchange-side position is zero\n\nProceed?"
+      )
+    )
+      return;
+    setBusy(true);
+    setResult(null);
+    const r = await forceFlatten();
+    setBusy(false);
+    setResult(r.message);
+  };
+
+  return (
+    <div className="bg-rose-50 border-y border-danger px-6 py-3 text-sm">
+      <div className="flex items-center gap-4 flex-wrap">
+        <span className="font-bold text-danger">
+          ⚠ Position desync detected
+        </span>
+        <span className="font-mono">
+          Bot:{" "}
+          <span className="font-bold">
+            {snap.bot_net_qty >= 0 ? "+" : ""}
+            {snap.bot_net_qty.toFixed(2)}
+          </span>
+        </span>
+        <span className="font-mono">
+          Exchange:{" "}
+          <span className="font-bold">
+            {snap.exchange_position >= 0 ? "+" : ""}
+            {snap.exchange_position.toFixed(2)}
+          </span>
+        </span>
+        <span className="font-mono text-danger font-bold">
+          Drift: {drift.toFixed(2)}
+        </span>
+        <button
+          onClick={onForceFlatten}
+          disabled={busy}
+          className="ml-auto px-3 py-1 rounded bg-danger text-white text-xs font-bold tracking-wide disabled:opacity-50 hover:bg-rose-700"
+        >
+          {busy ? "FLATTENING…" : "FORCE FLATTEN"}
+        </button>
+      </div>
+      {result && (
+        <div className="mt-2 font-mono text-xs text-danger">
+          → {result}
+        </div>
+      )}
+      <div className="text-xs text-muted mt-1">
+        A fill was likely missed. Click Force Flatten to cancel all orders +
+        market-close the residual position, or close manually on the
+        exchange.
       </div>
     </div>
   );
@@ -205,8 +458,13 @@ function AccordionStack({
         iconColor="text-violet-600"
         isOpen={openMap.inputs}
         onToggle={() => toggle("inputs")}
+        rightExtra={
+          snap && snap.start_price > 0
+            ? `start $${snap.start_price.toFixed(2)}`
+            : undefined
+        }
       >
-        <ConfigPanel cfg={cfg} setCfg={setCfg} />
+        <ConfigPanel cfg={cfg} setCfg={setCfg} snap={snap} />
       </Accordion>
 
       <Accordion
@@ -250,7 +508,13 @@ function AccordionStack({
         iconColor="text-amber-600"
         isOpen={openMap.orders}
         onToggle={() => toggle("orders")}
-        rightExtra={snap ? `${snap.open_orders.length}` : undefined}
+        rightExtra={
+          snap
+            ? snap.parked_tp_count > 0
+              ? `${snap.open_orders.length} · ${snap.parked_tp_count} parked`
+              : `${snap.open_orders.length}`
+            : undefined
+        }
       >
         <OpenOrders snap={snap} />
       </Accordion>
@@ -359,9 +623,11 @@ function Accordion({
 function ConfigPanel({
   cfg,
   setCfg,
+  snap,
 }: {
   cfg: AgentConfig;
   setCfg: (c: AgentConfig) => void;
+  snap: Snapshot | null;
 }) {
   const update = <K extends keyof AgentConfig>(
     section: K,
@@ -396,8 +662,23 @@ function ConfigPanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cfg.trading.exchange]);
 
+  const running = snap?.running ?? false;
+  const hasStarted = !!snap && snap.start_price > 0;
+
   return (
     <div className="space-y-5 pt-4">
+      {hasStarted && <BotStatusBlock snap={snap!} />}
+      <Section title="Identity">
+        <Field label="Agent name (used as the saved-agent key)">
+          <input
+            className="input"
+            value={cfg.name}
+            disabled={running}
+            placeholder="e.g. ETH Trend Long"
+            onChange={(e) => setCfg({ ...cfg, name: e.target.value })}
+          />
+        </Field>
+      </Section>
       <Section title="Trading">
         <div className="grid grid-cols-2 gap-3">
           <Field label="Exchange">
@@ -493,12 +774,6 @@ function ConfigPanel({
               on={(v) => update("basket", "basket_size_qty", v)}
             />
           </Field>
-          <Field label="SL distance">
-            <NumInput
-              v={cfg.basket.basket_sl_distance}
-              on={(v) => update("basket", "basket_sl_distance", v)}
-            />
-          </Field>
           <Field label="Max exposure">
             <div className="input bg-slate-50 font-mono">
               {(cfg.basket.num_baskets * cfg.basket.basket_size_qty).toFixed(4)}
@@ -508,6 +783,7 @@ function ConfigPanel({
       </Section>
 
       <Section title="Kill Switch">
+        <KillSwitchSanityWarning cfg={cfg} setCfg={setCfg} />
         <div className="grid grid-cols-2 gap-3">
           <Field label="Max position cap">
             <NumInput
@@ -589,6 +865,152 @@ function ConfigPanel({
           </Field>
         </div>
       </Section>
+    </div>
+  );
+}
+
+/// Warns when Kill Switch settings are clearly misconfigured so a fresh
+/// session won't blow up on the first fill. Two trigger conditions:
+///   1. max_position_cap < per_step_qty  (single fill instantly trips)
+///   2. max_position_cap < num_baskets × basket_size_qty (cap < expected exposure)
+/// Offers a one-click "Use suggested" button to fix it.
+function KillSwitchSanityWarning({
+  cfg,
+  setCfg,
+}: {
+  cfg: AgentConfig;
+  setCfg: (c: AgentConfig) => void;
+}) {
+  const maxExposure = cfg.basket.num_baskets * cfg.basket.basket_size_qty;
+  const cap = cfg.kill_switch.max_position_cap;
+  const per = cfg.trading.per_step_qty;
+
+  const tooSmallForOneFill = cap < per;
+  const tooSmallForFullExposure = cap < maxExposure;
+
+  if (!tooSmallForOneFill && !tooSmallForFullExposure) return null;
+
+  // Suggested cap = 20% headroom above max exposure.
+  const suggested = Math.max(
+    Math.ceil(maxExposure * 1.2),
+    Math.ceil(per * 2)
+  );
+
+  const applySuggested = () => {
+    setCfg({
+      ...cfg,
+      kill_switch: { ...cfg.kill_switch, max_position_cap: suggested },
+    });
+  };
+
+  return (
+    <div className="rounded-md border border-danger bg-rose-50 p-3 mb-3 text-sm">
+      <div className="font-bold text-danger mb-1">
+        ⚠ Max position cap is too low
+      </div>
+      <ul className="text-xs text-ink/80 space-y-1 list-disc ml-5 mb-2">
+        {tooSmallForOneFill && (
+          <li>
+            <span className="font-mono">cap ({cap})</span> &lt;{" "}
+            <span className="font-mono">per_step_qty ({per})</span> → a single
+            fill will instantly trip the kill switch.
+          </li>
+        )}
+        {tooSmallForFullExposure && (
+          <li>
+            <span className="font-mono">cap ({cap})</span> &lt;{" "}
+            <span className="font-mono">
+              max_exposure ({maxExposure.toFixed(4)})
+            </span>{" "}
+            (= # baskets × basket size) → the kill switch will trip before
+            all baskets fully fill.
+          </li>
+        )}
+      </ul>
+      <div className="flex items-center gap-2 text-xs">
+        <span className="text-muted">Suggested:</span>
+        <span className="font-mono font-bold">{suggested}</span>
+        <button
+          type="button"
+          className="btn btn-ghost text-xs py-1 px-3 ml-auto"
+          onClick={applySuggested}
+        >
+          Use suggested
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function BotStatusBlock({ snap }: { snap: Snapshot }) {
+  const drift = snap.cycle_anchor - snap.start_price;
+  const driftStr =
+    drift === 0
+      ? "0.00"
+      : `${drift > 0 ? "+" : ""}${drift.toFixed(2)}`;
+  const driftColor =
+    drift > 0 ? "text-good" : drift < 0 ? "text-danger" : "text-muted";
+  return (
+    <div className="rounded-md border border-edge bg-slate-50 p-4">
+      <div className="flex items-center justify-between mb-3">
+        <h3>Bot Status</h3>
+        <span className="text-xs text-muted">
+          hits{" "}
+          <span className="text-ink font-bold">
+            {snap.basket_hits}/{snap.max_basket_hits}
+          </span>
+        </span>
+      </div>
+      <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+        <StatusBox label="Bot started" v={`$${snap.start_price.toFixed(2)}`} />
+        <StatusBox label="Cycle anchor" v={`$${snap.cycle_anchor.toFixed(2)}`} />
+        <StatusBox
+          label="Cycle drift"
+          v={`${driftStr}`}
+          color={driftColor}
+        />
+        <StatusBox
+          label="Upper limit"
+          v={`$${snap.cycle_upper.toFixed(2)}`}
+          color="text-danger"
+        />
+        <StatusBox
+          label="Lower limit"
+          v={`$${snap.cycle_lower.toFixed(2)}`}
+          color="text-danger"
+        />
+        <StatusBox
+          label="Distance ±"
+          v={`$${snap.grid_distance.toFixed(2)}`}
+          color="text-accent"
+        />
+        <StatusBox
+          label="Current mid"
+          v={`$${snap.mid_price.toFixed(2)}`}
+          color="text-ink"
+        />
+      </div>
+    </div>
+  );
+}
+
+function StatusBox({
+  label,
+  v,
+  color = "text-ink",
+}: {
+  label: string;
+  v: string;
+  color?: string;
+}) {
+  return (
+    <div className="rounded bg-white border border-edge px-3 py-2">
+      <div className="text-[10px] font-bold tracking-wider uppercase text-muted">
+        {label}
+      </div>
+      <div className={`text-base font-bold mt-0.5 tabular-nums ${color}`}>
+        {v}
+      </div>
     </div>
   );
 }
@@ -686,12 +1108,17 @@ function BasketCard({ b }: { b: Snapshot["baskets"][0] }) {
     IDLE: "border-edge text-muted",
     ACTIVE: "border-blue-300 text-blue-700",
     TPRECYCLING: "border-emerald-300 text-emerald-700",
-    KILLED: "border-rose-300 text-rose-700 opacity-70",
+    // HIT = just cycle-SL'd; displayed as KILLED but basket can still trade.
+    HIT: "border-rose-300 text-rose-700 opacity-80",
+    KILLED: "border-rose-400 text-rose-800 opacity-60",
   };
   const sideBadge =
     b.side === "LONG"
       ? "bg-emerald-100 text-emerald-700"
       : "bg-rose-100 text-rose-700";
+  // Render HIT as "KILLED" to match the user-facing terminology, but reserve
+  // a separate look for the permanent KILLED (more faded, darker red).
+  const displayStatus = b.status === "HIT" ? "KILLED" : b.status;
   return (
     <div className={`border rounded-md p-3 bg-white ${colorMap[b.status]}`}>
       <div className="flex justify-between items-center mb-2 gap-2">
@@ -701,19 +1128,35 @@ function BasketCard({ b }: { b: Snapshot["baskets"][0] }) {
         >
           {b.side}
         </span>
-        <span className="text-[10px] tracking-widest ml-auto">{b.status}</span>
+        <span className="text-[10px] tracking-widest ml-auto">
+          {displayStatus}
+        </span>
       </div>
       <div className="font-mono space-y-1.5 text-ink/85">
         <Row k="open" v={b.open_qty.toFixed(4)} />
         <Row k="max" v={b.max_qty.toFixed(4)} />
         <Row k="avg" v={b.avg_price > 0 ? b.avg_price.toFixed(2) : "—"} />
-        <Row k="SL" v={b.sl_price ? b.sl_price.toFixed(2) : "—"} />
         <Row
           k="PnL"
           v={b.realized_pnl.toFixed(4)}
           highlight={b.realized_pnl !== 0}
         />
         <Row k="fills/tp" v={`${b.fills_count}/${b.tp_count}`} />
+        {/* Per-basket SL — set on first entry fill, fixed for basket life. */}
+        <div className="pt-2 mt-1 border-t border-edge/60 space-y-1.5">
+          <Row
+            k="anchor"
+            v={b.anchor_price > 0 ? b.anchor_price.toFixed(2) : "—"}
+          />
+          <Row
+            k="upper SL"
+            v={b.upper_sl > 0 ? b.upper_sl.toFixed(2) : "—"}
+          />
+          <Row
+            k="lower SL"
+            v={b.lower_sl > 0 ? b.lower_sl.toFixed(2) : "—"}
+          />
+        </div>
       </div>
     </div>
   );
@@ -877,7 +1320,13 @@ function TradeSummary({ snap }: { snap: Snapshot | null }) {
 
       {/* Row 2 — trip counts and timing. */}
       <KPI label="Round Trips" v={ts.round_trips.toString()} color="text-good" />
-      <KPI label="SL Count" v={ts.sl_count.toString()} color="text-danger" />
+      {/* SL Count = number of basket hits (cycle resets), NOT individual
+          SL exit fills. Each cycle SL hit increments by exactly 1. */}
+      <KPI
+        label="SL Count (basket hits)"
+        v={(snap?.basket_hits ?? 0).toString()}
+        color="text-danger"
+      />
       <KPI label="RTP / Hour" v={Math.round(ts.rtp_per_hour).toString()} />
       <KPI label="Duration" v={durationStr} />
 
@@ -924,27 +1373,90 @@ function KPI({
 }
 
 /* ===================================================================
-   TRADE HISTORY — every INDIVIDUAL fill (entries + TPs + SLs)
+   TRADE HISTORY — one row per logical ORDER (partials aggregated)
    =================================================================== */
+type AggregatedFill = {
+  /** Synthetic key for React + CSV; first fill_id of the group. */
+  group_id: string;
+  order_id: string;
+  basket_id: string;
+  side: "BUY" | "SELL";
+  purpose: string;
+  /** Volume-weighted average price across all partials. */
+  price: number;
+  /** Sum of all partial qtys. */
+  qty: number;
+  /** Sum of all partial fees. */
+  fee: number;
+  /** Earliest partial timestamp — when the order first started filling. */
+  timestamp: number;
+  /** How many partials rolled up into this row (≥ 1). */
+  partials: number;
+};
+
+/// Collapse consecutive partial-fills for the same `order_id` into one
+/// aggregated row. Deribit reports every partial chunk as a separate trade
+/// (e.g. one $2000 limit fills as 1166 + 396 + 438), so the raw list shows
+/// the same order N times. The user wants ONE row per logical order.
+function aggregateFills(
+  fills: Snapshot["recent_fills"]
+): AggregatedFill[] {
+  const byOrder = new Map<string, AggregatedFill>();
+  for (const f of fills) {
+    const existing = byOrder.get(f.order_id);
+    if (existing) {
+      // Running volume-weighted price: (Σ p·q + p·q) / (Σ q + q)
+      const newQty = existing.qty + f.qty;
+      existing.price =
+        (existing.price * existing.qty + f.price * f.qty) / (newQty || 1);
+      existing.qty = newQty;
+      existing.fee += f.fee;
+      existing.timestamp = Math.min(existing.timestamp, f.timestamp);
+      existing.partials += 1;
+    } else {
+      byOrder.set(f.order_id, {
+        group_id: f.fill_id,
+        order_id: f.order_id,
+        basket_id: f.basket_id,
+        side: f.side,
+        purpose: f.purpose,
+        price: f.price,
+        qty: f.qty,
+        fee: f.fee,
+        timestamp: f.timestamp,
+        partials: 1,
+      });
+    }
+  }
+  // Sort by earliest timestamp ascending (matches original Fill ordering).
+  return Array.from(byOrder.values()).sort((a, b) => a.timestamp - b.timestamp);
+}
+
 function TradeHistory({ snap }: { snap: Snapshot | null }) {
   const fills = snap?.recent_fills ?? [];
   if (fills.length === 0) {
     return <EmptyState text="No fills yet" />;
   }
+  const aggregated = aggregateFills(fills);
   // Newest first in the UI.
-  const reversed = [...fills].reverse();
+  const reversed = [...aggregated].reverse();
   return (
     <div className="pt-4">
       <div className="flex justify-between items-center mb-3">
         <div className="text-xs text-muted">
-          {fills.length} individual fill{fills.length === 1 ? "" : "s"}
+          {aggregated.length} order{aggregated.length === 1 ? "" : "s"}
+          {fills.length !== aggregated.length && (
+            <span className="ml-1">
+              (from {fills.length} partial{fills.length === 1 ? "" : "s"})
+            </span>
+          )}
           {fills.length >= 1000 && (
             <span className="ml-1 text-warn">(buffer cap — older fills evicted)</span>
           )}
         </div>
         <button
           className="btn btn-ghost text-xs"
-          onClick={() => downloadFillsCsv([...fills])}
+          onClick={() => downloadAggregatedCsv(aggregated)}
         >
           ⬇ Download CSV
         </button>
@@ -965,13 +1477,22 @@ function TradeHistory({ snap }: { snap: Snapshot | null }) {
           </thead>
           <tbody>
             {reversed.map((f, idx) => {
-              const n = fills.length - idx;
+              const n = aggregated.length - idx;
               const sideCls =
                 f.side === "BUY" ? "text-good font-bold" : "text-danger font-bold";
               const purposeLabel = purposeText(f.purpose);
               const purposeCls = purposeColor(f.purpose);
+              const partialBadge =
+                f.partials > 1 ? (
+                  <span
+                    className="ml-1 text-[10px] text-muted"
+                    title={`Filled in ${f.partials} partials`}
+                  >
+                    ×{f.partials}
+                  </span>
+                ) : null;
               return (
-                <tr key={f.fill_id} className="border-t border-edge">
+                <tr key={f.group_id} className="border-t border-edge">
                   <Td>
                     <span className="text-muted font-bold">{n}</span>
                   </Td>
@@ -980,7 +1501,7 @@ function TradeHistory({ snap }: { snap: Snapshot | null }) {
                       {new Date(f.timestamp).toLocaleTimeString()}
                     </span>
                   </Td>
-                  <Td>#{/* basket index isn't on Fill — show id stub */}
+                  <Td>
                     <span className="text-muted">
                       {f.basket_id.slice(0, 4)}…
                     </span>
@@ -996,6 +1517,7 @@ function TradeHistory({ snap }: { snap: Snapshot | null }) {
                   </Td>
                   <Td right>
                     <span className="font-bold">{f.qty.toFixed(4)}</span>
+                    {partialBadge}
                   </Td>
                   <Td right>
                     <span className="text-muted">{f.fee.toFixed(4)}</span>
@@ -1038,23 +1560,27 @@ function purposeColor(p: string): string {
   }
 }
 
-/// CSV export for every individual fill (Trade History view).
-function downloadFillsCsv(fills: Snapshot["recent_fills"]) {
-  if (fills.length === 0) return;
-  const header = "FILL_COUNT,TIME,SIDE,PURPOSE,PRICE,QTY,FEE,BASKET_ID";
-  const rows = fills.map((f, i) => {
+/// CSV export for aggregated fills — one row per logical order (matches the
+/// Trade History view, partials rolled up by order_id).
+function downloadAggregatedCsv(rows: AggregatedFill[]) {
+  if (rows.length === 0) return;
+  const header =
+    "ORDER_COUNT,TIME,SIDE,PURPOSE,AVG_PRICE,QTY,FEE,PARTIALS,ORDER_ID,BASKET_ID";
+  const csvRows = rows.map((f, i) => {
     return [
       i + 1,
       new Date(f.timestamp).toISOString(),
       f.side,
       purposeText(f.purpose),
-      f.price,
-      f.qty,
+      f.price.toFixed(6),
+      f.qty.toFixed(6),
       f.fee.toFixed(6),
+      f.partials,
+      f.order_id,
       f.basket_id,
     ].join(",");
   });
-  const csv = [header, ...rows].join("\n");
+  const csv = [header, ...csvRows].join("\n");
   const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");

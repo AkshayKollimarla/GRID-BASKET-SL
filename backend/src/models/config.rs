@@ -49,6 +49,10 @@ fn default_grid_distance() -> f64 {
 pub struct BasketConfig {
     pub num_baskets: u32,
     pub basket_size_qty: f64,
+    /// Legacy field; ignored. Per-basket SL was removed in favor of the
+    /// single cycle SL controlled by grid_distance. Kept here with serde
+    /// default so older saved configs still deserialize cleanly.
+    #[serde(default)]
     pub basket_sl_distance: f64,
 }
 
@@ -87,15 +91,26 @@ pub struct EmergencySlicingConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
+    /// Human-friendly identifier so the user can save & reload configs
+    /// without re-typing them. Editable in the UI. Persisted with the
+    /// agent. Defaults to "Agent" on legacy configs that didn't have a
+    /// name field.
+    #[serde(default = "default_agent_name")]
+    pub name: String,
     pub trading: TradingConfig,
     pub basket: BasketConfig,
     pub kill_switch: KillSwitchConfig,
     pub slicing: EmergencySlicingConfig,
 }
 
+fn default_agent_name() -> String {
+    "Agent".into()
+}
+
 impl AgentConfig {
     pub fn default_demo() -> Self {
         Self {
+            name: "Demo Agent".into(),
             trading: TradingConfig {
                 token: "BTC-USDT".into(),
                 exchange: Exchange::Mock,

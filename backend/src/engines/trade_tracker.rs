@@ -38,8 +38,15 @@ struct State {
     rtp_count: u64,
     sl_count: u64,
     total_fees: f64,
+    /// USD notional summed across all buy fills. For inverse = sum(qty),
+    /// for linear = sum(qty * price).
     buy_volume: f64,
     sell_volume: f64,
+    /// Price-weighted accumulators = sum(price * qty), used ONLY for VWAP.
+    /// Always sum(price * qty) regardless of inverse/linear — VWAP =
+    /// notional / qty correctly yields price-units (USD/BTC) in both cases.
+    buy_notional: f64,
+    sell_notional: f64,
     buy_qty: f64,
     sell_qty: f64,
     total_fills: u64,
@@ -53,6 +60,10 @@ pub struct TradeTracker {
     /// True if the underlying exchange uses inverse contracts (qty in USD).
     /// In that case PnL = (exit-entry)*qty / entry_price.
     is_inverse: bool,
+    /// Configured tp_spread — used to pair TP closures with their original
+    /// entry lot by PRICE (not FIFO). A TP that fills at X was placed by an
+    /// entry at X + tp_spread (short) or X - tp_spread (long).
+    tp_spread: f64,
 }
 
 impl TradeTracker {
@@ -60,10 +71,12 @@ impl TradeTracker {
         basket_mgr: Arc<BasketManager>,
         start_time_ms: i64,
         is_inverse: bool,
+        tp_spread: f64,
     ) -> Self {
         Self {
             basket_mgr,
             is_inverse,
+            tp_spread,
             state: Mutex::new(State {
                 start_time_ms,
                 lots: HashMap::new(),
@@ -75,6 +88,8 @@ impl TradeTracker {
                 total_fees: 0.0,
                 buy_volume: 0.0,
                 sell_volume: 0.0,
+                buy_notional: 0.0,
+                sell_notional: 0.0,
                 buy_qty: 0.0,
                 sell_qty: 0.0,
                 total_fills: 0,
@@ -104,17 +119,23 @@ impl TradeTracker {
             fill.qty * fill.price
         };
 
-        // Side-agnostic volume/qty counters.
+        // Always-sum(price*qty) — separately from the USD-volume above —
+        // so VWAP works for both inverse (qty in USD) and linear (qty in BTC).
+        let price_qty = fill.price * fill.qty;
+
+        // Side-agnostic counters.
         match fill.side {
             Side::Buy => {
                 s.total_buys += 1;
                 s.buy_qty += fill.qty;
                 s.buy_volume += notional_usd;
+                s.buy_notional += price_qty;
             }
             Side::Sell => {
                 s.total_sells += 1;
                 s.sell_qty += fill.qty;
                 s.sell_volume += notional_usd;
+                s.sell_notional += price_qty;
             }
         }
 
@@ -150,14 +171,40 @@ impl TradeTracker {
         let mut rtp_count_delta = 0u64;
         let mut sl_count_delta = 0u64;
         let mut new_rtps: Vec<RoundTrip> = Vec::new();
+        // For TP closures, the lot we want is NOT the oldest (FIFO) — it's
+        // the entry that this TP was placed for. That entry's price is
+        // `exit_price ± tp_spread` (sign depends on side):
+        //   closing BUY  (short TP) → entry SELL price = exit + tp_spread
+        //   closing SELL (long  TP) → entry BUY  price = exit − tp_spread
+        // If we find a lot whose price matches that, use it. Otherwise fall
+        // back to FIFO (e.g., for SL / kill-switch closures where no specific
+        // lot pairing exists).
+        let expected_entry_price = if is_tp {
+            Some(match fill.side {
+                Side::Buy => exit_price + self.tp_spread,
+                Side::Sell => exit_price - self.tp_spread,
+            })
+        } else {
+            None
+        };
+        let price_tolerance = 0.5_f64;
+
         {
             let lots = s.lots.entry(basket_id).or_default();
             while qty_to_close > 1e-12 && !lots.is_empty() {
-                let take = qty_to_close.min(lots[0].qty_remaining);
-                let lot = lots[0].clone();
-                lots[0].qty_remaining -= take;
-                if lots[0].qty_remaining <= 1e-12 {
-                    lots.remove(0);
+                // Pick the lot to consume — price match for TPs, FIFO else.
+                let lot_idx = if let Some(target) = expected_entry_price {
+                    lots.iter()
+                        .position(|l| (l.price - target).abs() < price_tolerance)
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+                let take = qty_to_close.min(lots[lot_idx].qty_remaining);
+                let lot = lots[lot_idx].clone();
+                lots[lot_idx].qty_remaining -= take;
+                if lots[lot_idx].qty_remaining <= 1e-12 {
+                    lots.remove(lot_idx);
                 }
                 qty_to_close -= take;
 
@@ -224,13 +271,16 @@ impl TradeTracker {
         let duration_secs = duration_ms / 1000;
         let duration_hours = duration_ms as f64 / 3_600_000.0;
 
+        // VWAP = sum(price * qty) / sum(qty) — gives the average price (USD/BTC)
+        // weighted by qty. Works for inverse AND linear because we accumulate
+        // price * qty (not the USD volume) into the *_notional fields.
         let buy_vwap = if s.buy_qty > 0.0 {
-            s.buy_volume / s.buy_qty
+            s.buy_notional / s.buy_qty
         } else {
             0.0
         };
         let sell_vwap = if s.sell_qty > 0.0 {
-            s.sell_volume / s.sell_qty
+            s.sell_notional / s.sell_qty
         } else {
             0.0
         };

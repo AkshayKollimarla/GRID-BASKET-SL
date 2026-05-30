@@ -20,3 +20,7 @@ npm-debug.log*
 .idea/
 *.swp
 .DS_Store
+
+# Runtime data (saved agent configs, TS incremental cache)
+backend/agents.json
+frontend/tsconfig.tsbuildinfo

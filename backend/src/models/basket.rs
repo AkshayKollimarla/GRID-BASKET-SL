@@ -7,6 +7,13 @@ pub enum BasketStatus {
     Idle,
     Active,
     TpRecycling,
+    /// Cycle SL just hit this basket — it was flattened. Visually displayed
+    /// as "KILLED" in the UI, but the basket is still tradeable: the next
+    /// entry fill will flip status back to Active. Use this for the
+    /// transient "I just got SL'd" indicator.
+    Hit,
+    /// Permanent kill. Caused by the kill switch (max_basket_hits reached or
+    /// manual KILL button). Basket never trades again until manual Reset.
     Killed,
 }
 
@@ -28,20 +35,30 @@ pub struct Basket {
     pub max_qty: f64,
     pub open_qty: f64,
     pub avg_price: f64,
-    pub sl_distance: f64,
-    pub sl_price: Option<f64>,
     pub status: BasketStatus,
     pub realized_pnl: f64,
     pub unrealized_pnl: f64,
     pub fills_count: u32,
     pub tp_count: u32,
-    /// True for INVERSE contracts (Deribit BTC-PERPETUAL etc.) where the
-    /// order amount is in QUOTE currency (USD) and PnL formula must divide
-    /// by entry price to convert to base-currency PnL × price.
-    /// False for LINEAR contracts (Hyperliquid, mock) where amount is in
-    /// BASE currency directly.
+    /// True for INVERSE contracts (Deribit BTC-PERPETUAL etc.).
     #[serde(default)]
     pub is_inverse: bool,
+    /// TP spread (= profit per round-trip). Stored on the basket so
+    /// apply_tp_fill can compute the per-fill PnL without needing the
+    /// engine config passed in.
+    #[serde(default)]
+    pub tp_spread: f64,
+    /// PER-BASKET SL — set on the basket's FIRST entry fill. The anchor is
+    /// the fill price at activation; the basket's SL fires when mid
+    /// crosses anchor ± grid_distance. 0.0 = not yet activated.
+    /// Each basket is independent: when its own SL hits, only THIS basket
+    /// is killed; the other baskets continue trading.
+    #[serde(default)]
+    pub anchor_price: f64,
+    #[serde(default)]
+    pub upper_sl: f64,
+    #[serde(default)]
+    pub lower_sl: f64,
 }
 
 impl Basket {
@@ -49,8 +66,8 @@ impl Basket {
         index: u32,
         side: BasketSide,
         max_qty: f64,
-        sl_distance: f64,
         is_inverse: bool,
+        tp_spread: f64,
     ) -> Self {
         Self {
             basket_id: Uuid::new_v4(),
@@ -59,15 +76,38 @@ impl Basket {
             max_qty,
             open_qty: 0.0,
             avg_price: 0.0,
-            sl_distance,
-            sl_price: None,
             status: BasketStatus::Idle,
             realized_pnl: 0.0,
             unrealized_pnl: 0.0,
             fills_count: 0,
             tp_count: 0,
             is_inverse,
+            tp_spread,
+            anchor_price: 0.0,
+            upper_sl: 0.0,
+            lower_sl: 0.0,
         }
+    }
+
+    /// Set this basket's per-basket SL anchor and bounds. Called once,
+    /// when the basket's first entry fill arrives. Subsequent fills do
+    /// not move the anchor — it stays at the activation price.
+    pub fn set_sl_anchor(&mut self, anchor: f64, distance: f64) {
+        if self.anchor_price > 0.0 {
+            return; // already set — do not overwrite
+        }
+        self.anchor_price = anchor;
+        self.upper_sl = anchor + distance.max(0.0);
+        self.lower_sl = anchor - distance.max(0.0);
+    }
+
+    /// True when this basket has open positions AND mid has crossed its
+    /// own SL boundary → caller should flatten + permanently KILL it.
+    pub fn sl_breached(&self, mid: f64) -> bool {
+        self.anchor_price > 0.0
+            && self.open_qty > 0.0
+            && self.status != BasketStatus::Killed
+            && (mid <= self.lower_sl || mid >= self.upper_sl)
     }
 
     /// Convert a (exit - entry) × qty product into USD-denominated PnL,
@@ -86,16 +126,6 @@ impl Basket {
         self.status != BasketStatus::Killed && (self.open_qty + qty) <= self.max_qty
     }
 
-    /// Recompute the per-side SL price after a fill changes avg_price.
-    /// Long: SL fires when price falls below avg - sl_distance.
-    /// Short: SL fires when price rises above avg + sl_distance.
-    fn recompute_sl(&mut self) {
-        self.sl_price = Some(match self.side {
-            BasketSide::Long => self.avg_price - self.sl_distance,
-            BasketSide::Short => self.avg_price + self.sl_distance,
-        });
-    }
-
     pub fn apply_entry_fill(&mut self, fill_qty: f64, fill_price: f64) {
         // Weighted average price update (same formula for both sides — open_qty
         // is always tracked as positive magnitude).
@@ -107,25 +137,34 @@ impl Basket {
         }
         self.open_qty = new_qty;
         self.fills_count += 1;
-        self.recompute_sl();
         self.status = BasketStatus::Active;
     }
 
-    pub fn apply_tp_fill(&mut self, tp_qty: f64, tp_price: f64) {
-        // PnL sign depends on basket side; magnitude depends on inverse flag.
-        let diff = match self.side {
-            BasketSide::Long => tp_price - self.avg_price,   // long profits on up moves
-            BasketSide::Short => self.avg_price - tp_price,  // short profits on down moves
-        };
-        let pnl = self.pnl_usd(diff, tp_qty, self.avg_price);
+    pub fn apply_tp_fill(&mut self, tp_qty: f64, _tp_price: f64) {
+        // PnL per TP fill is FIXED = tp_spread × qty (sign always positive
+        // because we placed the TP exactly at tp_spread above/below entry).
+        // We ignore tp_price here — it's just the fill price, which equals
+        // the limit price for a post-only maker order.
+        //
+        // For INVERSE contracts (Deribit), divide by avg to get USD PnL.
+        let pnl = self.pnl_usd(self.tp_spread, tp_qty, self.avg_price);
         self.realized_pnl += pnl;
         self.open_qty = (self.open_qty - tp_qty).max(0.0);
         self.tp_count += 1;
-        self.status = if self.open_qty > 0.0 {
-            BasketStatus::TpRecycling
+        if self.open_qty > 1e-9 {
+            self.status = BasketStatus::TpRecycling;
         } else {
-            BasketStatus::Idle
-        };
+            // Basket fully closed — reset the per-basket SL anchor so the
+            // NEXT entry fill re-anchors at fresh price. Without this the
+            // basket would re-activate with a stale SL range (set when it
+            // first activated), potentially born already inside its old
+            // SL bounds → instant kill on the next fill.
+            self.status = BasketStatus::Idle;
+            self.anchor_price = 0.0;
+            self.upper_sl = 0.0;
+            self.lower_sl = 0.0;
+            self.avg_price = 0.0;
+        }
     }
 
     pub fn kill(&mut self, exit_price: f64) {
@@ -142,9 +181,10 @@ impl Basket {
     }
 
     /// Soft cycle reset: close out at exit_price (booking PnL into
-    /// realized_pnl), then return the basket to Idle so the next cycle can
-    /// trade it again. Unlike `kill`, this does NOT set the basket to Killed.
-    /// realized_pnl, fills_count, tp_count are preserved (cumulative).
+    /// realized_pnl), then mark the basket as Hit. The UI displays Hit as
+    /// "KILLED" so you can see which baskets just got cycle-SL'd, but the
+    /// basket is still tradeable — the next entry fill will return it to
+    /// Active. realized_pnl, fills_count, tp_count are preserved (cumulative).
     pub fn soft_reset(&mut self, exit_price: f64) {
         if self.open_qty > 0.0 {
             let diff = match self.side {
@@ -156,7 +196,6 @@ impl Basket {
         }
         self.open_qty = 0.0;
         self.avg_price = 0.0;
-        self.sl_price = None;
-        self.status = BasketStatus::Idle;
+        self.status = BasketStatus::Hit;
     }
 }

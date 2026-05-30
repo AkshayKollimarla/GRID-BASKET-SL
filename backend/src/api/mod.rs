@@ -342,36 +342,37 @@ async fn delete_agent(
 
 #[derive(Debug, Deserialize)]
 struct SummaryQuery {
+    /// Legacy "last N hours" — used by the old sidebar mini-summary.
     hours: Option<u64>,
+    /// Explicit start (Unix epoch milliseconds). Overrides `hours`.
+    since_ms: Option<i64>,
+    /// Explicit end (Unix epoch milliseconds). Defaults to now.
+    until_ms: Option<i64>,
 }
 
-/// 24h (default) summary endpoint — reads every per-agent history
-/// JSONL file under `history/`, filters by timestamp >= now − hours,
-/// and aggregates by (exchange, token). The frontend sidebar polls
-/// this and renders one row per coin.
+/// Summary endpoint — reads every per-agent history JSONL under
+/// `history/`, filters by timestamp within [since_ms, until_ms], and
+/// returns:
+///   - `accounts: [ { name, agents:[…], cumulative:{…} } ]`
+///   - `rows: [ … ]` — legacy aggregation by (exchange, token) used by
+///     the small sidebar summary section.
+/// One ROW per (exchange, token) for the legacy small summary; one
+/// AGENT entry per (account, agent) for the Summary Report view.
 async fn summary(
     State(state): State<Arc<AppState>>,
     Query(q): Query<SummaryQuery>,
 ) -> impl IntoResponse {
     use std::collections::HashMap;
-    let hours = q.hours.unwrap_or(24).max(1);
     let now_ms = chrono::Utc::now().timestamp_millis();
-    let since_ms = now_ms - (hours as i64) * 3_600_000;
+    let since_ms = q.since_ms.unwrap_or_else(|| {
+        let hours = q.hours.unwrap_or(24).max(1) as i64;
+        now_ms - hours * 3_600_000
+    });
+    let until_ms = q.until_ms.unwrap_or(now_ms);
+    let elapsed_hours = ((until_ms - since_ms).max(1) as f64) / 3_600_000.0;
 
-    #[derive(Default)]
-    struct Agg {
-        rtp_count: u64,
-        gross_pnl: f64,
-        fees: f64,
-        rebates: f64,
-        volume: f64,
-        qty: f64,
-        basket_hits: u64,
-        basket_hit_pnl: f64,
-        agents: std::collections::BTreeSet<String>,
-    }
-
-    let mut agg: HashMap<(String, String), Agg> = HashMap::new();
+    // Helper: read every history event in [since, until] into one vec.
+    let mut events: Vec<crate::engine::HistoryEvent> = Vec::new();
     let history_dir = std::path::Path::new("history");
     if let Ok(entries) = std::fs::read_dir(history_dir) {
         for entry in entries.flatten() {
@@ -388,36 +389,236 @@ async fn summary(
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                if ev.ts < since_ms {
+                if ev.ts < since_ms || ev.ts > until_ms {
                     continue;
                 }
-                let key = (ev.exchange.clone(), ev.token.clone());
-                let s = agg.entry(key).or_default();
-                s.agents.insert(ev.agent.clone());
-                match ev.kind.as_str() {
-                    "rtp" | "sl_rtp" => {
-                        s.rtp_count += 1;
-                        s.gross_pnl += ev.gross_pnl;
-                        // Negative fees are exchange-paid maker rebates.
-                        if ev.fees >= 0.0 {
-                            s.fees += ev.fees;
-                        } else {
-                            s.rebates += -ev.fees;
-                        }
-                        s.volume += ev.volume;
-                        s.qty += ev.qty;
-                    }
-                    "basket_hit" => {
-                        s.basket_hits += 1;
-                        s.basket_hit_pnl += ev.gross_pnl;
-                    }
-                    _ => {}
-                }
+                events.push(ev);
             }
         }
     }
 
-    let mut rows: Vec<serde_json::Value> = agg
+    // ── Per-agent aggregation for the Summary Report view ────────────
+    #[derive(Default)]
+    struct AgentAgg {
+        token: String,
+        exchange: String,
+        rtp_count: u64,
+        gross_pnl: f64,
+        fees: f64,
+        rebates: f64,
+        volume: f64,
+        qty: f64,
+        basket_hits: u64,
+        basket_hit_pnl: f64,
+        // VWAP accumulators — sum(price × qty) and sum(qty) per side.
+        buy_pq_sum: f64,
+        buy_qty_sum: f64,
+        sell_pq_sum: f64,
+        sell_qty_sum: f64,
+        buys: u64,
+        sells: u64,
+    }
+    let mut per_agent: HashMap<(String, String), AgentAgg> = HashMap::new();
+    let mut active_set = std::collections::HashSet::new();
+    for k in state.engines.iter() {
+        active_set.insert(k.key().clone());
+    }
+
+    for ev in &events {
+        let key = (ev.exchange.clone(), ev.agent.clone());
+        let a = per_agent.entry(key).or_default();
+        a.exchange = ev.exchange.clone();
+        a.token = ev.token.clone();
+        match ev.kind.as_str() {
+            "rtp" | "sl_rtp" => {
+                a.rtp_count += 1;
+                a.gross_pnl += ev.gross_pnl;
+                if ev.fees >= 0.0 {
+                    a.fees += ev.fees;
+                } else {
+                    a.rebates += -ev.fees;
+                }
+                a.volume += ev.volume;
+                a.qty += ev.qty;
+                // Each RT = 1 buy leg + 1 sell leg of equal qty. One
+                // leg's price is `entry_price`, the other is
+                // `exit_price`, depending on `entry_side`.
+                let entry_is_buy = ev.entry_side.eq_ignore_ascii_case("BUY");
+                let (buy_price, sell_price) = if entry_is_buy {
+                    (ev.entry_price, ev.exit_price)
+                } else {
+                    (ev.exit_price, ev.entry_price)
+                };
+                if buy_price > 0.0 {
+                    a.buy_pq_sum += buy_price * ev.qty;
+                    a.buy_qty_sum += ev.qty;
+                    a.buys += 1;
+                }
+                if sell_price > 0.0 {
+                    a.sell_pq_sum += sell_price * ev.qty;
+                    a.sell_qty_sum += ev.qty;
+                    a.sells += 1;
+                }
+            }
+            "basket_hit" => {
+                a.basket_hits += 1;
+                a.basket_hit_pnl += ev.gross_pnl;
+            }
+            _ => {}
+        }
+    }
+
+    // Group per-agent rows by EXCHANGE (= "account" for now). Each
+    // group also carries a CUMULATIVE row.
+    let mut by_account: HashMap<String, Vec<(String, AgentAgg)>> = HashMap::new();
+    for ((exchange, agent), a) in per_agent {
+        by_account.entry(exchange).or_default().push((agent, a));
+    }
+    let mut accounts: Vec<serde_json::Value> = Vec::new();
+    for (account, mut agents_in_acc) in by_account {
+        agents_in_acc.sort_by(|(a, _), (b, _)| a.cmp(b));
+        let agents_json: Vec<serde_json::Value> = agents_in_acc
+            .iter()
+            .map(|(name, a)| {
+                let buy_vwap = if a.buy_qty_sum > 0.0 {
+                    a.buy_pq_sum / a.buy_qty_sum
+                } else {
+                    0.0
+                };
+                let sell_vwap = if a.sell_qty_sum > 0.0 {
+                    a.sell_pq_sum / a.sell_qty_sum
+                } else {
+                    0.0
+                };
+                let net_pnl = a.gross_pnl - a.fees + a.rebates + a.basket_hit_pnl;
+                let pnl_per_rtp = if a.rtp_count > 0 {
+                    net_pnl / a.rtp_count as f64
+                } else {
+                    0.0
+                };
+                let rtp_per_hr = a.rtp_count as f64 / elapsed_hours;
+                let vol_per_hr = a.volume / elapsed_hours;
+                json!({
+                    "name": name,
+                    "symbol": a.token,
+                    "status": if active_set.contains(name) { "active" } else { "inactive" },
+                    "buy_vwap": buy_vwap,
+                    "sell_vwap": sell_vwap,
+                    "buys": a.buys,
+                    "sells": a.sells,
+                    "rtps": a.rtp_count,
+                    "rtp_per_hr": rtp_per_hr,
+                    "gross_pnl": a.gross_pnl,
+                    "fees": a.fees,
+                    "rebates": a.rebates,
+                    "net_pnl": net_pnl,
+                    "pnl_per_rtp": pnl_per_rtp,
+                    "vol_per_hr": vol_per_hr,
+                    "volume": a.volume,
+                    "basket_hits": a.basket_hits,
+                    "basket_hit_pnl": a.basket_hit_pnl,
+                })
+            })
+            .collect();
+        // Per-account cumulative row.
+        let cum = agents_in_acc.iter().fold(AgentAgg::default(), |mut c, (_, a)| {
+            c.rtp_count += a.rtp_count;
+            c.gross_pnl += a.gross_pnl;
+            c.fees += a.fees;
+            c.rebates += a.rebates;
+            c.volume += a.volume;
+            c.qty += a.qty;
+            c.basket_hits += a.basket_hits;
+            c.basket_hit_pnl += a.basket_hit_pnl;
+            c.buy_pq_sum += a.buy_pq_sum;
+            c.buy_qty_sum += a.buy_qty_sum;
+            c.sell_pq_sum += a.sell_pq_sum;
+            c.sell_qty_sum += a.sell_qty_sum;
+            c.buys += a.buys;
+            c.sells += a.sells;
+            c
+        });
+        let cum_net = cum.gross_pnl - cum.fees + cum.rebates + cum.basket_hit_pnl;
+        let cum_pnl_per_rtp = if cum.rtp_count > 0 {
+            cum_net / cum.rtp_count as f64
+        } else {
+            0.0
+        };
+        let cum_buy_vwap = if cum.buy_qty_sum > 0.0 {
+            cum.buy_pq_sum / cum.buy_qty_sum
+        } else {
+            0.0
+        };
+        let cum_sell_vwap = if cum.sell_qty_sum > 0.0 {
+            cum.sell_pq_sum / cum.sell_qty_sum
+        } else {
+            0.0
+        };
+        accounts.push(json!({
+            "name": account,
+            "agent_count": agents_json.len(),
+            "agents": agents_json,
+            "cumulative": {
+                "buys": cum.buys,
+                "sells": cum.sells,
+                "rtps": cum.rtp_count,
+                "rtp_per_hr": cum.rtp_count as f64 / elapsed_hours,
+                "buy_vwap": cum_buy_vwap,
+                "sell_vwap": cum_sell_vwap,
+                "gross_pnl": cum.gross_pnl,
+                "fees": cum.fees,
+                "rebates": cum.rebates,
+                "net_pnl": cum_net,
+                "pnl_per_rtp": cum_pnl_per_rtp,
+                "vol_per_hr": cum.volume / elapsed_hours,
+                "volume": cum.volume,
+                "basket_hits": cum.basket_hits,
+                "basket_hit_pnl": cum.basket_hit_pnl,
+            }
+        }));
+    }
+    accounts.sort_by(|a, b| {
+        a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or(""))
+    });
+
+    // ── Legacy aggregation by (exchange, token) for the small sidebar ──
+    #[derive(Default)]
+    struct CoinAgg {
+        rtp_count: u64,
+        gross_pnl: f64,
+        fees: f64,
+        rebates: f64,
+        volume: f64,
+        qty: f64,
+        basket_hits: u64,
+        basket_hit_pnl: f64,
+        agents: std::collections::BTreeSet<String>,
+    }
+    let mut coin_agg: HashMap<(String, String), CoinAgg> = HashMap::new();
+    for ev in &events {
+        let key = (ev.exchange.clone(), ev.token.clone());
+        let s = coin_agg.entry(key).or_default();
+        s.agents.insert(ev.agent.clone());
+        match ev.kind.as_str() {
+            "rtp" | "sl_rtp" => {
+                s.rtp_count += 1;
+                s.gross_pnl += ev.gross_pnl;
+                if ev.fees >= 0.0 {
+                    s.fees += ev.fees;
+                } else {
+                    s.rebates += -ev.fees;
+                }
+                s.volume += ev.volume;
+                s.qty += ev.qty;
+            }
+            "basket_hit" => {
+                s.basket_hits += 1;
+                s.basket_hit_pnl += ev.gross_pnl;
+            }
+            _ => {}
+        }
+    }
+    let mut rows: Vec<serde_json::Value> = coin_agg
         .into_iter()
         .map(|((exchange, token), s)| {
             let per_rtp_pnl = if s.rtp_count > 0 {
@@ -454,13 +655,14 @@ async fn summary(
         ka.cmp(&kb)
     });
 
-    let _ = state; // appstate not needed but kept for signature consistency
     (
         StatusCode::OK,
         Json(json!({
-            "hours": hours,
+            "hours": ((until_ms - since_ms) / 3_600_000).max(1),
             "since_ms": since_ms,
+            "until_ms": until_ms,
             "now_ms": now_ms,
+            "accounts": accounts,
             "rows": rows,
         })),
     )

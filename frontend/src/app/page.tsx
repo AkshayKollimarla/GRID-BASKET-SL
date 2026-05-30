@@ -17,9 +17,14 @@ import {
   saveAgent,
   deleteAgent,
   getSummary,
+  getSummaryRange,
   AgentList,
   SummaryReport,
   SummaryRow,
+  SummaryReportFull,
+  ReportAccount,
+  ReportAgentRow,
+  ReportCumulative,
 } from "@/lib/api";
 
 /* ===================================================================
@@ -34,6 +39,10 @@ export default function Home() {
   const [agents, setAgents] = useState<AgentList>({ agents: [], active: [] });
   const [summary, setSummary] = useState<SummaryReport>({ hours: 24, rows: [] });
   const [err, setErr] = useState<string | null>(null);
+  // View toggle — "agent" shows the per-agent detail (Agent Inputs,
+  // Baskets, etc.); "summary" shows the full Summary Report with
+  // date-range filters and per-account/per-agent tables.
+  const [view, setView] = useState<"agent" | "summary">("agent");
 
   useEffect(() => {
     getDefaultConfig()
@@ -119,20 +128,34 @@ export default function Home() {
         agents={agents}
         currentName={cfg.name}
         summary={summary}
-        onSelect={selectAgent}
-        onCreate={createAgent}
+        view={view}
+        onSelect={(a) => {
+          setView("agent");
+          selectAgent(a);
+        }}
+        onCreate={() => {
+          setView("agent");
+          createAgent();
+        }}
+        onOpenSummary={() => setView("summary")}
         onDeleted={refreshAgents}
       />
       <div className="flex-1 min-w-0">
-        <TopBar
-          cfg={cfg}
-          snap={snap}
-          onSaved={refreshAgents}
-        />
-        <PositionDriftBanner snap={snap} cfg={cfg} />
-        <div className="px-6 pb-8 max-w-7xl mx-auto">
-          <AccordionStack cfg={cfg} setCfg={setCfg} snap={snap} />
-        </div>
+        {view === "summary" ? (
+          <SummaryReportView />
+        ) : (
+          <>
+            <TopBar
+              cfg={cfg}
+              snap={snap}
+              onSaved={refreshAgents}
+            />
+            <PositionDriftBanner snap={snap} cfg={cfg} />
+            <div className="px-6 pb-8 max-w-7xl mx-auto">
+              <AccordionStack cfg={cfg} setCfg={setCfg} snap={snap} />
+            </div>
+          </>
+        )}
       </div>
     </main>
   );
@@ -151,15 +174,19 @@ function AgentsSidebar({
   agents,
   currentName,
   summary,
+  view,
   onSelect,
   onCreate,
+  onOpenSummary,
   onDeleted,
 }: {
   agents: AgentList;
   currentName: string;
   summary: SummaryReport;
+  view: "agent" | "summary";
   onSelect: (a: AgentConfig) => void;
   onCreate: () => void | Promise<void>;
+  onOpenSummary: () => void;
   onDeleted: () => void | Promise<void>;
 }) {
   const activeSet = useMemo(() => new Set(agents.active), [agents.active]);
@@ -194,6 +221,16 @@ function AgentsSidebar({
           onClick={onCreate}
         >
           + Create Agent
+        </button>
+        <button
+          className={`mt-2 w-full text-xs font-bold px-2 py-1.5 rounded border ${
+            view === "summary"
+              ? "border-good bg-emerald-50 text-good"
+              : "border-edge bg-white hover:bg-slate-100"
+          }`}
+          onClick={onOpenSummary}
+        >
+          📊 Summary Report
         </button>
       </div>
 
@@ -2175,3 +2212,340 @@ function formatDuration(sec: number): string {
   if (m > 0) return `${m}m ${s}s`;
   return `${s}s`;
 }
+
+/* ===================================================================
+   SUMMARY REPORT — full-width main-panel view with date-range
+   filters and per-account / per-agent tables. Replaces the agent
+   detail when "Summary Report" is selected in the sidebar.
+   =================================================================== */
+type RangePreset = "today" | "prev_day" | "last_7" | "last_30" | "custom";
+
+function presetRange(p: RangePreset): { since: number; until: number } {
+  const now = Date.now();
+  const dayMs = 24 * 3600 * 1000;
+  switch (p) {
+    case "today": {
+      const start = new Date();
+      start.setHours(0, 0, 0, 0);
+      return { since: start.getTime(), until: now };
+    }
+    case "prev_day": {
+      const end = new Date();
+      end.setHours(0, 0, 0, 0);
+      const start = new Date(end.getTime() - dayMs);
+      return { since: start.getTime(), until: end.getTime() };
+    }
+    case "last_7":
+      return { since: now - 7 * dayMs, until: now };
+    case "last_30":
+      return { since: now - 30 * dayMs, until: now };
+    default:
+      return { since: now - dayMs, until: now };
+  }
+}
+
+function SummaryReportView() {
+  const [preset, setPreset] = useState<RangePreset>("prev_day");
+  const [range, setRange] = useState(() => presetRange("prev_day"));
+  const [data, setData] = useState<SummaryReportFull>({
+    since_ms: range.since,
+    until_ms: range.until,
+    now_ms: Date.now(),
+    accounts: [],
+  });
+  const [loading, setLoading] = useState(false);
+
+  const fetchData = async (sinceMs: number, untilMs: number) => {
+    setLoading(true);
+    const r = await getSummaryRange(sinceMs, untilMs);
+    setData(r);
+    setLoading(false);
+  };
+
+  useEffect(() => {
+    fetchData(range.since, range.until);
+    const t = setInterval(() => fetchData(range.since, range.until), 10_000);
+    return () => clearInterval(t);
+  }, [range.since, range.until]);
+
+  const applyPreset = (p: RangePreset) => {
+    setPreset(p);
+    setRange(presetRange(p));
+  };
+
+  const applyCustom = (since: number, until: number) => {
+    setPreset("custom");
+    setRange({ since, until });
+  };
+
+  return (
+    <div className="px-6 py-5">
+      <div className="flex items-center gap-3 mb-4">
+        <div className="text-2xl">📊</div>
+        <h1 className="m-0">Summary Report</h1>
+      </div>
+
+      <div className="bg-white border border-edge rounded-lg p-3 mb-2 flex flex-wrap items-center gap-2">
+        <PresetButton
+          label="Today"
+          active={preset === "today"}
+          onClick={() => applyPreset("today")}
+        />
+        <PresetButton
+          label="Prev Day"
+          active={preset === "prev_day"}
+          onClick={() => applyPreset("prev_day")}
+          variant="primary"
+        />
+        <PresetButton
+          label="Last 7 Days"
+          active={preset === "last_7"}
+          onClick={() => applyPreset("last_7")}
+        />
+        <PresetButton
+          label="Last 30 Days"
+          active={preset === "last_30"}
+          onClick={() => applyPreset("last_30")}
+        />
+        <span className="ml-2 text-xs text-muted">From</span>
+        <input
+          type="datetime-local"
+          className="input text-xs py-1 px-2 w-44"
+          value={toLocalDateTime(range.since)}
+          onChange={(e) =>
+            applyCustom(new Date(e.target.value).getTime(), range.until)
+          }
+        />
+        <span className="text-xs text-muted">to</span>
+        <input
+          type="datetime-local"
+          className="input text-xs py-1 px-2 w-44"
+          value={toLocalDateTime(range.until)}
+          onChange={(e) =>
+            applyCustom(range.since, new Date(e.target.value).getTime())
+          }
+        />
+        <button
+          className="ml-auto btn btn-ghost text-xs"
+          disabled={loading}
+          onClick={() => fetchData(range.since, range.until)}
+        >
+          ⟳ Refresh
+        </button>
+        <button
+          className="btn btn-ghost text-xs"
+          onClick={() => downloadReportCsv(data)}
+        >
+          ⬇ CSV
+        </button>
+      </div>
+      <div className="text-xs text-muted mb-4 px-1">
+        Filters:{" "}
+        <span className="text-good font-bold font-mono">
+          {fmtDateTime(range.since)} → {fmtDateTime(range.until)}
+        </span>
+      </div>
+
+      {data.accounts.length === 0 ? (
+        <div className="bg-white border border-edge rounded-lg p-6 text-center text-muted">
+          {loading
+            ? "Loading…"
+            : "No fills inside the selected window. Run a bot, or widen the range."}
+        </div>
+      ) : (
+        data.accounts.map((acc) => (
+          <AccountTable key={acc.name} account={acc} />
+        ))
+      )}
+    </div>
+  );
+}
+
+function PresetButton({
+  label,
+  active,
+  onClick,
+  variant,
+}: {
+  label: string;
+  active: boolean;
+  onClick: () => void;
+  variant?: "primary";
+}) {
+  const base =
+    "px-3 py-1 rounded-full text-xs font-bold border whitespace-nowrap";
+  const cls = active
+    ? variant === "primary"
+      ? "bg-good text-white border-good"
+      : "bg-ink text-white border-ink"
+    : "bg-white text-ink border-edge hover:bg-slate-100";
+  return (
+    <button className={`${base} ${cls}`} onClick={onClick}>
+      {label}
+    </button>
+  );
+}
+
+function AccountTable({ account }: { account: ReportAccount }) {
+  return (
+    <div className="mb-6">
+      <div className="mb-2 flex items-baseline gap-2">
+        <h2 className="m-0 text-lg uppercase tracking-wider text-slate-700">
+          {account.name}
+        </h2>
+        <span className="text-xs text-muted">
+          ({account.agent_count} agent{account.agent_count === 1 ? "" : "s"})
+        </span>
+      </div>
+      <div className="overflow-x-auto border border-edge rounded-lg bg-white">
+        <table className="w-full text-xs">
+          <thead className="bg-slate-50 text-muted">
+            <tr>
+              <Th>Agent Name</Th>
+              <Th>Symbol</Th>
+              <Th>Status</Th>
+              <Th right>Buy VWAP</Th>
+              <Th right>Sell VWAP</Th>
+              <Th right>Buys</Th>
+              <Th right>Sells</Th>
+              <Th right>RTPs</Th>
+              <Th right>RTP/HR</Th>
+              <Th right>PNL ($)</Th>
+              <Th right>PNL/RTP</Th>
+              <Th right>VOL/HR ($)</Th>
+              <Th right>Volume</Th>
+              <Th right>Hits</Th>
+            </tr>
+          </thead>
+          <tbody>
+            {account.agents.map((a) => (
+              <AgentReportRow key={a.name} a={a} />
+            ))}
+            <CumulativeRow c={account.cumulative} />
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function AgentReportRow({ a }: { a: ReportAgentRow }) {
+  const pnlCls =
+    a.net_pnl > 0
+      ? "text-good font-bold"
+      : a.net_pnl < 0
+      ? "text-danger font-bold"
+      : "text-ink font-bold";
+  const statusBadge =
+    a.status === "active"
+      ? "bg-emerald-100 text-emerald-700"
+      : "bg-slate-200 text-slate-600";
+  return (
+    <tr className="border-t border-edge hover:bg-slate-50">
+      <Td><span className="font-bold">{a.name}</span></Td>
+      <Td><span className="text-blue-700 font-mono">{a.symbol}</span></Td>
+      <Td>
+        <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${statusBadge}`}>
+          {a.status.toUpperCase()}
+        </span>
+      </Td>
+      <Td right>{fmtVwap(a.buy_vwap)}</Td>
+      <Td right>{fmtVwap(a.sell_vwap)}</Td>
+      <Td right>{a.buys}</Td>
+      <Td right>{a.sells}</Td>
+      <Td right>{a.rtps}</Td>
+      <Td right>{a.rtp_per_hr.toFixed(2)}</Td>
+      <Td right><span className={pnlCls}>{fmtMoneySigned(a.net_pnl)}</span></Td>
+      <Td right><span className={pnlCls}>{fmtMoneySigned(a.pnl_per_rtp, 4)}</span></Td>
+      <Td right><span className="text-amber-700 font-bold">{fmtMoneySigned(a.vol_per_hr, 0)}</span></Td>
+      <Td right><span className="text-amber-700 font-bold">{fmtMoneySigned(a.volume, 0)}</span></Td>
+      <Td right>{a.basket_hits}</Td>
+    </tr>
+  );
+}
+
+function CumulativeRow({ c }: { c: ReportCumulative }) {
+  const pnlCls =
+    c.net_pnl > 0
+      ? "text-good font-bold"
+      : c.net_pnl < 0
+      ? "text-danger font-bold"
+      : "text-ink font-bold";
+  return (
+    <tr className="border-t-2 border-edge bg-slate-50">
+      <Td><span className="text-[11px] uppercase tracking-widest text-slate-700 font-bold">▸ Cumulative</span></Td>
+      <Td><span className="text-[10px] text-muted">All Sessions Combined</span></Td>
+      <Td>—</Td>
+      <Td right>{fmtVwap(c.buy_vwap)}</Td>
+      <Td right>{fmtVwap(c.sell_vwap)}</Td>
+      <Td right><strong>{c.buys}</strong></Td>
+      <Td right><strong>{c.sells}</strong></Td>
+      <Td right><strong>{c.rtps}</strong></Td>
+      <Td right><strong>{c.rtp_per_hr.toFixed(2)}</strong></Td>
+      <Td right><span className={pnlCls}>{fmtMoneySigned(c.net_pnl)}</span></Td>
+      <Td right><span className={pnlCls}>{fmtMoneySigned(c.pnl_per_rtp, 4)}</span></Td>
+      <Td right><span className="text-amber-700 font-bold">{fmtMoneySigned(c.vol_per_hr, 0)}</span></Td>
+      <Td right><span className="text-amber-700 font-bold">{fmtMoneySigned(c.volume, 0)}</span></Td>
+      <Td right><strong>{c.basket_hits}</strong></Td>
+    </tr>
+  );
+}
+
+function fmtVwap(v: number): string {
+  if (v <= 0) return "—";
+  return v.toFixed(4);
+}
+
+function fmtMoneySigned(n: number, dp: number = 2): string {
+  const sign = n > 0 ? "+" : n < 0 ? "−" : "";
+  const a = Math.abs(n);
+  if (a >= 1_000_000) return `${sign}$${(a / 1_000_000).toFixed(2)}M`;
+  if (a >= 1_000 && dp <= 2) return `${sign}$${(a / 1_000).toFixed(2)}k`;
+  return `${sign}$${a.toFixed(dp)}`;
+}
+
+function fmtDateTime(ms: number): string {
+  const d = new Date(ms);
+  return `${d.toLocaleDateString()} ${d.toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+  })}`;
+}
+
+function toLocalDateTime(ms: number): string {
+  const d = new Date(ms);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function downloadReportCsv(data: SummaryReportFull) {
+  if (data.accounts.length === 0) return;
+  const header =
+    "ACCOUNT,AGENT,SYMBOL,STATUS,BUY_VWAP,SELL_VWAP,BUYS,SELLS,RTPS,RTP_PER_HR,GROSS_PNL,FEES,REBATES,NET_PNL,PNL_PER_RTP,VOL_PER_HR,VOLUME,BASKET_HITS,BASKET_HIT_PNL";
+  const rows: string[] = [];
+  for (const acc of data.accounts) {
+    for (const a of acc.agents) {
+      rows.push(
+        [
+          acc.name, a.name, a.symbol, a.status,
+          a.buy_vwap, a.sell_vwap, a.buys, a.sells,
+          a.rtps, a.rtp_per_hr, a.gross_pnl, a.fees, a.rebates,
+          a.net_pnl, a.pnl_per_rtp, a.vol_per_hr, a.volume,
+          a.basket_hits, a.basket_hit_pnl,
+        ].join(",")
+      );
+    }
+  }
+  const csv = [header, ...rows].join("\n");
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  const ts = new Date().toISOString().replace(/[:.]/g, "-");
+  a.download = `summary_${ts}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+

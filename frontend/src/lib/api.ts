@@ -372,6 +372,68 @@ export async function getSummary(hours: number = 24): Promise<SummaryReport> {
   }
 }
 
+/* Summary Report — per-agent rows grouped by account, with date range. */
+export type ReportAgentRow = {
+  name: string;
+  symbol: string;
+  status: "active" | "inactive";
+  buy_vwap: number;
+  sell_vwap: number;
+  buys: number;
+  sells: number;
+  rtps: number;
+  rtp_per_hr: number;
+  gross_pnl: number;
+  fees: number;
+  rebates: number;
+  net_pnl: number;
+  pnl_per_rtp: number;
+  vol_per_hr: number;
+  volume: number;
+  basket_hits: number;
+  basket_hit_pnl: number;
+};
+export type ReportCumulative = Omit<ReportAgentRow, "name" | "symbol" | "status">;
+export type ReportAccount = {
+  name: string;
+  agent_count: number;
+  agents: ReportAgentRow[];
+  cumulative: ReportCumulative;
+};
+export type SummaryReportFull = {
+  since_ms: number;
+  until_ms: number;
+  now_ms: number;
+  accounts: ReportAccount[];
+};
+
+export async function getSummaryRange(
+  since_ms: number,
+  until_ms: number
+): Promise<SummaryReportFull> {
+  const empty: SummaryReportFull = {
+    since_ms,
+    until_ms,
+    now_ms: Date.now(),
+    accounts: [],
+  };
+  try {
+    const r = await fetch(
+      `${BASE}/api/summary?since_ms=${since_ms}&until_ms=${until_ms}`,
+      { cache: "no-store" }
+    );
+    const j = await safeJson(r);
+    return {
+      since_ms: j?.since_ms ?? since_ms,
+      until_ms: j?.until_ms ?? until_ms,
+      now_ms: j?.now_ms ?? Date.now(),
+      accounts: Array.isArray(j?.accounts) ? j.accounts : [],
+    };
+  } catch {
+    return empty;
+  }
+}
+
 /** Remove a saved agent from the sidebar. */
 export async function deleteAgent(name: string) {
   try {

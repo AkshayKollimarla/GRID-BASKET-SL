@@ -90,6 +90,21 @@ pub struct HistoryEvent {
     /// Round-trip qty (one leg) or basket-hit closed qty.
     pub qty: f64,
     pub basket_index: u32,
+    /// "BUY" or "SELL" — the side of the ENTRY fill that opened this
+    /// round trip. For an RTP, buy_vwap is computed from the buy-side
+    /// price and sell_vwap from the sell-side price; for basket_hit
+    /// this field is ignored.
+    #[serde(default)]
+    pub entry_side: String,
+    /// Entry fill price (price at which the round trip's first leg was
+    /// opened). For basket_hit this can be 0.
+    #[serde(default)]
+    pub entry_price: f64,
+    /// Exit fill price (price at which the round trip's closing leg
+    /// fired — fill_price ± tp_spread). For basket_hit = the market
+    /// price at flatten time.
+    #[serde(default)]
+    pub exit_price: f64,
 }
 
 pub struct EngineHandle {
@@ -508,6 +523,9 @@ impl EngineHandle {
             volume: rt.volume * 2.0,
             qty: rt.qty,
             basket_index: rt.basket_index,
+            entry_side: format!("{:?}", rt.entry_side).to_uppercase(),
+            entry_price: rt.entry_price,
+            exit_price: rt.exit_price,
         };
         self.append_history(ev).await;
     }
@@ -533,6 +551,9 @@ impl EngineHandle {
             volume: qty_closed * exit_price.max(0.0),
             qty: qty_closed,
             basket_index,
+            entry_side: String::new(),
+            entry_price: 0.0,
+            exit_price,
         };
         self.append_history(ev).await;
     }

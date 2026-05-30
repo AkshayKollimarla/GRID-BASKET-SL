@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import {
   AgentConfig,
   RoundTrip,
@@ -113,7 +113,18 @@ function AgentsSidebar({
   onEdit: (cfg: AgentConfig) => void;
   onDeleted: () => void | Promise<void>;
 }) {
-  const list = agents.agents;
+  // Sort: ACTIVE agent first (pinned to the top), then the rest in their
+  // original (load) order. Stable secondary sort keeps the inactive list
+  // from shuffling tick-to-tick.
+  const list = useMemo(() => {
+    const arr = [...agents.agents];
+    arr.sort((a, b) => {
+      const aActive = activeName === a.name ? 0 : 1;
+      const bActive = activeName === b.name ? 0 : 1;
+      return aActive - bActive;
+    });
+    return arr;
+  }, [agents.agents, activeName]);
   return (
     <aside className="w-64 shrink-0 border-r border-edge bg-slate-50 min-h-screen sticky top-0 self-start max-h-screen overflow-y-auto">
       <div className="px-4 py-4 border-b border-edge">
@@ -131,12 +142,27 @@ function AgentsSidebar({
         </div>
       ) : (
         <ul className="py-2">
-          {list.map((a) => {
+          {list.map((a, idx) => {
             const isActive = activeName === a.name;
             const isEditing = currentName === a.name;
+            // Show an "Inactive" divider once we transition past the
+            // active agent (which is pinned at the top). Only rendered
+            // if there IS an active agent AND there's at least one
+            // inactive one below it.
+            const prev = idx > 0 ? list[idx - 1] : null;
+            const showInactiveDivider =
+              !!activeName &&
+              !!prev &&
+              activeName === prev.name &&
+              !isActive;
             return (
+              <React.Fragment key={a.name}>
+                {showInactiveDivider && (
+                  <li className="px-3 pt-3 pb-1 text-[10px] uppercase tracking-widest text-muted">
+                    Inactive
+                  </li>
+                )}
               <li
-                key={a.name}
                 className={`px-3 py-2 mx-2 mb-1 rounded border ${
                   isActive
                     ? "border-good bg-emerald-50"
@@ -203,6 +229,7 @@ function AgentsSidebar({
                   </button>
                 </div>
               </li>
+              </React.Fragment>
             );
           })}
         </ul>
@@ -1133,7 +1160,14 @@ function BasketCard({ b }: { b: Snapshot["baskets"][0] }) {
         </span>
       </div>
       <div className="font-mono space-y-1.5 text-ink/85">
-        <Row k="open" v={b.open_qty.toFixed(4)} />
+        <Row
+          k="net"
+          v={
+            (b.net_qty >= 0 ? "+" : "") +
+            b.net_qty.toFixed(4) +
+            (b.net_qty > 0 ? " L" : b.net_qty < 0 ? " S" : "")
+          }
+        />
         <Row k="max" v={b.max_qty.toFixed(4)} />
         <Row k="avg" v={b.avg_price > 0 ? b.avg_price.toFixed(2) : "—"} />
         <Row

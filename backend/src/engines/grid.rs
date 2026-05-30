@@ -1,6 +1,6 @@
 use crate::engines::basket_manager::BasketManager;
 use crate::exchanges::Exchange;
-use crate::models::{AgentConfig, BasketSide, OrderPurpose, Side};
+use crate::models::{AgentConfig, OrderPurpose, Side};
 use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -19,6 +19,14 @@ pub struct GridEngine {
     /// `take_pending_log()` and forwards to the bot status log so the
     /// user sees them in the UI.
     pub pending_log: Arc<Mutex<Vec<String>>>,
+    /// Internal grid anchor price — separate from the cycle anchor used
+    /// by per-basket SL. This anchor only moves when mid has drifted
+    /// more than `depth × step` from it. While mid wobbles inside that
+    /// band, the anchor stays put and the grid does NOT churn. When mid
+    /// crosses the band edge we re-anchor at current mid and refresh
+    /// any entries that are now too far from the new anchor. Mirrors
+    /// the HL bot's "Grid re-anchored to $X" pattern.
+    pub grid_anchor: Arc<Mutex<Option<f64>>>,
 }
 
 impl GridEngine {
@@ -42,6 +50,7 @@ impl GridEngine {
             exchange,
             last_grid_summary: Arc::new(Mutex::new(None)),
             pending_log: Arc::new(Mutex::new(Vec::new())),
+            grid_anchor: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -117,45 +126,77 @@ impl GridEngine {
         let cycle_lower = anchor - distance;
         let cycle_upper = anchor + distance;
 
-        // FORBIDDEN ZONE — no entry may rest inside [mid − tp_spread/2, mid + tp_spread/2].
-        // The zone TRAILS MID so the grid follows price up and down. As mid
-        // moves, old entries on the wrong side of the new zone get pulled
-        // and new ones are placed at the fresh 1st-level slots:
-        //   • 1st SELL = mid + tp_spread/2 (e.g., mid 2011 + 1.25 = 2012.25)
-        //   • 1st BUY  = mid − tp_spread/2 (e.g., mid 2011 − 1.25 = 2009.75)
-        //   • gap between them = exactly tp_spread (the user's rule)
-        // TPs are exempt — they're priced off their own entry fill, not off mid.
+        // ---------- Re-anchor decision (hysteresis) ----------
+        // The grid keeps its own anchor, separate from the cycle SL anchor.
+        // It moves only when mid has drifted more than `depth × step` from
+        // it. Inside that band the anchor stays put → no churn. Outside →
+        // we re-anchor at current mid and refresh stale orders.
+        let re_anchor_threshold = (depth as f64) * step;
+        let mut re_anchored = false;
+        let active_anchor = {
+            let mut guard = self.grid_anchor.lock();
+            let need_reanchor = match *guard {
+                None => true,
+                Some(a) => (a - mid).abs() > re_anchor_threshold,
+            };
+            if need_reanchor {
+                *guard = Some(mid);
+                re_anchored = true;
+                mid
+            } else {
+                guard.unwrap_or(mid)
+            }
+        };
+        if re_anchored {
+            self.pending_log.lock().push(format!(
+                "Grid re-anchored to {:.2} (mid {:.4}, threshold ±{:.2})",
+                active_anchor, mid, re_anchor_threshold
+            ));
+        }
+
+        // FORBIDDEN ZONE — no entry may rest inside
+        // [active_anchor − tp_spread/2, active_anchor + tp_spread/2].
+        // Anchored placement gives a stable grid: 1st SELL at
+        // active_anchor + half_spread, 1st BUY at active_anchor −
+        // half_spread, both quantized to 0.5 tick. TPs are exempt — they
+        // sit at their per-fill prices, parked off-exchange when out of
+        // depth budget (see process_fill in engine.rs).
         let half_spread = (t.tp_spread / 2.0).max(0.0);
 
         // ---------- 1. Cancel stale orders ----------
-        // PARK-AND-WAIT POLICY (user's explicit rule):
-        //   • Cancel an ENTRY only when it is now on the WRONG SIDE of
-        //     mid (mid crossed past it; would be a taker if filled). No
-        //     "too far" cancellation — once placed, an order rests
-        //     parked at its price until it fills naturally or becomes
-        //     wrong-side.
-        //   • TPs are NEVER cancelled. Each TP rests at `fill ± tp_spread`
-        //     from the moment its entry filled until price comes back to
-        //     close the round trip.
-        // Result: NO churn. The previous "cancel if > depth × step from
-        // mid" rule caused the grid to repeatedly cancel + re-place the
-        // same orders every time mid wobbled by ~step/2 — that's what
-        // produced the timestamp-spam in the user's screenshot.
-        // When count < depth on a side (e.g. after a fill or wrong-side
-        // cancel), step #3 below fills the gap with a new order near
-        // current mid.
+        // Re-anchor-aware cancel:
+        //   • Entry is WRONG-SIDE of mid → cancel (taker risk).
+        //   • Entry is more than `far_threshold` from the GRID ANCHOR
+        //     → cancel. Threshold is sized to comfortably contain every
+        //     planned grid level PLUS one step of buffer, so it never
+        //     false-cancels an order the placement loop just put down
+        //     (previously (depth+1)*step matched the furthest level
+        //     EXACTLY → float-precision oscillation cancelled & re-placed
+        //     the 3rd-level order every tick).
+        //   • TPs are NEVER cancelled by the grid tick (they sit at
+        //     their per-fill prices; out-of-budget ones are parked by
+        //     process_fill, not by us).
+        // Furthest planned level distance from anchor:
+        //   = half_spread + (depth - 1) * step
+        // Add `step` of buffer so re-anchor refreshes only orders that
+        // are genuinely outside the grid envelope.
         let eps = 1e-6_f64;
+        let far_threshold = half_spread + (depth as f64) * step + step;
         let open = self.exchange.open_orders().await;
         let mut cancelled_wrong_side = 0u32;
+        let mut cancelled_far = 0u32;
         for o in &open {
             let should_cancel = match o.purpose {
                 OrderPurpose::Entry => {
                     let wrong_side = (o.side == Side::Sell && o.price <= mid + eps)
                         || (o.side == Side::Buy && o.price >= mid - eps);
+                    let too_far = (o.price - active_anchor).abs() > far_threshold;
                     if wrong_side {
                         cancelled_wrong_side += 1;
+                    } else if too_far {
+                        cancelled_far += 1;
                     }
-                    wrong_side
+                    wrong_side || too_far
                 }
                 OrderPurpose::TakeProfit => false,
                 _ => false,
@@ -164,10 +205,12 @@ impl GridEngine {
                 let _ = self.exchange.cancel(o.order_id).await;
             }
         }
-        if cancelled_wrong_side > 0 {
+        if cancelled_wrong_side > 0 || cancelled_far > 0 {
             debug!(
                 wrong_side = cancelled_wrong_side,
-                "grid tick cancelled wrong-side entries"
+                far = cancelled_far,
+                far_threshold,
+                "grid tick cancelled stale entries"
             );
         }
 
@@ -191,19 +234,17 @@ impl GridEngine {
             return;
         }
 
-        // ---------- 3. Place entries anchored to mid ± tp_spread/2 ----------
-        // 1st sell sits EXACTLY at mid + tp_spread/2. 1st buy at mid −
-        // tp_spread/2. Subsequent levels are grid_step apart from there.
-        // Result: gap between 1st sell and 1st buy = tp_spread (the user's
-        // explicit rule). The grid_step controls intra-side spacing only.
-        //
-        // Base prices are quantized to a 0.5 tick so a tp_spread like 2.5
-        // (half_spread = 1.25) lands cleanly on 0.5-tick prices.
+        // ---------- 3. Place entries anchored to ACTIVE_ANCHOR ± half_spread ----
+        // 1st sell at active_anchor + half_spread, 1st buy at active_anchor −
+        // half_spread. Subsequent levels stepped out by grid_step. The
+        // anchor only moves when mid drifts > depth*step, so the grid
+        // is STABLE between re-anchors — placements aren't recomputed
+        // tick-by-tick from a wobbly mid.
         let tick = 0.5_f64;
         let quantize_up = |p: f64| (p / tick).ceil() * tick;
         let quantize_dn = |p: f64| (p / tick).floor() * tick;
-        let base_sell = quantize_up(mid + half_spread);
-        let base_buy = quantize_dn(mid - half_spread);
+        let base_sell = quantize_up(active_anchor + half_spread);
+        let base_buy = quantize_dn(active_anchor - half_spread);
 
         // 3a. Top up SELL side: 1st @ base_sell, then base_sell+step, +2·step…
         let mut need_sells = depth.saturating_sub(sell_count);
@@ -211,8 +252,8 @@ impl GridEngine {
         while need_sells > 0 && k <= 20 {
             let price = base_sell + (k as f64) * step;
             k += 1;
-            // Forbidden-zone guard (paranoia — base_sell already satisfies it).
-            if price < mid + half_spread - eps {
+            // Sanity guard: never place on or below mid (would be a taker).
+            if price <= mid + eps {
                 continue;
             }
             if price > cycle_upper {
@@ -223,9 +264,9 @@ impl GridEngine {
             }
             let Some(basket_id) = self
                 .basket_mgr
-                .find_basket_with_capacity_by_side(BasketSide::Short, per_step_qty)
+                .find_basket_with_capacity(per_step_qty, Side::Sell)
             else {
-                break; // no Short basket has capacity
+                break; // no basket has capacity for a SELL of this size
             };
             match self
                 .exchange
@@ -252,8 +293,8 @@ impl GridEngine {
         while need_buys > 0 && k <= 20 {
             let price = base_buy - (k as f64) * step;
             k += 1;
-            // Forbidden-zone guard (paranoia — base_buy already satisfies it).
-            if price > mid - half_spread + eps {
+            // Sanity guard: never place on or above mid (would be a taker).
+            if price >= mid - eps {
                 continue;
             }
             if price < cycle_lower {
@@ -264,7 +305,7 @@ impl GridEngine {
             }
             let Some(basket_id) = self
                 .basket_mgr
-                .find_basket_with_capacity_by_side(BasketSide::Long, per_step_qty)
+                .find_basket_with_capacity(per_step_qty, Side::Buy)
             else {
                 break;
             };

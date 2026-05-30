@@ -106,6 +106,8 @@ export type Snapshot = {
     realized_pnl: number;
     fills_count: number;
     tp_count: number;
+    /** Signed net position: + = net long, − = net short, 0 = flat. */
+    net_qty: number;
     /** Set on the basket's FIRST entry fill. 0 = not yet activated. */
     anchor_price: number;
     /** anchor_price + grid_distance. SL fires when mid ≥ this and open_qty > 0. */

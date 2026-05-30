@@ -6,8 +6,7 @@ use crate::engines::slicing::SlicingEngine;
 use crate::engines::trade_tracker::TradeTracker;
 use crate::exchanges::{DeribitClient, Exchange, HyperliquidClient, MockExchange};
 use crate::models::{
-    AgentConfig, BasketSide, Exchange as ExchangeKind, Fill, OrderPurpose, RoundTrip, Side,
-    TradeStats,
+    AgentConfig, Exchange as ExchangeKind, Fill, OrderPurpose, RoundTrip, Side, TradeStats,
 };
 use anyhow::{anyhow, Result};
 use parking_lot::RwLock;
@@ -287,25 +286,25 @@ impl EngineHandle {
         // Also drop every parked TP — operator wants a clean slate.
         self.parked_tps.write().clear();
 
-        // 2. Flatten every basket with open qty via slicing.
-        let to_flatten: Vec<(uuid::Uuid, BasketSide, f64, u32)> = self
+        // 2. Flatten every basket with open qty via slicing — direction
+        //    determined by SIGN of net_qty (positive = net long, sell to
+        //    close; negative = net short, buy to close).
+        let to_flatten: Vec<(uuid::Uuid, f64, u32)> = self
             .basket_mgr
             .baskets
             .iter()
             .filter_map(|e| {
                 let b = e.value();
-                if b.open_qty > 0.0 {
-                    Some((b.basket_id, b.side, b.open_qty, b.index))
+                if b.net_qty.abs() > 1e-9 {
+                    Some((b.basket_id, b.net_qty, b.index))
                 } else {
                     None
                 }
             })
             .collect();
-        for (bid, basket_side, qty, idx) in to_flatten {
-            let close_side = match basket_side {
-                BasketSide::Long => Side::Sell,
-                BasketSide::Short => Side::Buy,
-            };
+        for (bid, net_qty, idx) in to_flatten {
+            let close_side = if net_qty > 0.0 { Side::Sell } else { Side::Buy };
+            let qty = net_qty.abs();
             match self
                 .slicing
                 .flatten(bid, close_side, qty, OrderPurpose::KillSwitchExit)
@@ -429,17 +428,12 @@ impl EngineHandle {
         // Pull the live exchange position for drift detection. Bot's net qty
         // (long basket open_qty - short basket open_qty) should match this.
         let exchange_position = self.exchange.position().await;
+        // Bot net = signed sum of each basket's net_qty.
         let bot_net_qty: f64 = self
             .basket_mgr
             .baskets
             .iter()
-            .map(|e| {
-                let b = e.value();
-                match b.side {
-                    crate::models::BasketSide::Long => b.open_qty,
-                    crate::models::BasketSide::Short => -b.open_qty,
-                }
-            })
+            .map(|e| e.value().net_qty)
             .sum();
         let position_drift = (exchange_position - bot_net_qty).abs();
         let parked_tp_count = self.parked_tps.read().len();
@@ -623,13 +617,7 @@ pub fn spawn_engine(handle: Arc<EngineHandle>, mut fills_rx: broadcast::Receiver
                     .basket_mgr
                     .baskets
                     .iter()
-                    .map(|e| {
-                        let b = e.value();
-                        match b.side {
-                            BasketSide::Long => b.open_qty,
-                            BasketSide::Short => -b.open_qty,
-                        }
-                    })
+                    .map(|e| e.value().net_qty)
                     .sum();
                 let drift = (xpos - bot_net).abs();
                 // 0.5 unit tolerance covers floating-point noise.
@@ -694,14 +682,14 @@ async fn process_fill(h: &EngineHandle, fill: Fill) {
             // the basket has open_qty, ONLY this basket gets killed —
             // other baskets keep trading.
             let distance = h.config.trading.grid_distance.max(0.0);
-            let (basket_idx, basket_side, avg_price, just_activated, upper, lower) = {
+            let (basket_idx, net_qty, avg_price, just_activated, upper, lower) = {
                 if let Some(mut b) = h.basket_mgr.baskets.get_mut(&fill.basket_id) {
                     let was_unactivated = b.anchor_price <= 0.0;
-                    b.apply_entry_fill(fill.qty, fill.price);
+                    b.apply_entry_fill(fill.qty, fill.price, fill.side);
                     if was_unactivated {
                         b.set_sl_anchor(fill.price, distance);
                     }
-                    (b.index, b.side, b.avg_price, was_unactivated, b.upper_sl, b.lower_sl)
+                    (b.index, b.net_qty, b.avg_price, was_unactivated, b.upper_sl, b.lower_sl)
                 } else {
                     return;
                 }
@@ -713,16 +701,19 @@ async fn process_fill(h: &EngineHandle, fill: Fill) {
                 ));
             }
             h.log_line(format!(
-                "ENTRY {:?} basket#{} qty={:.4} px={:.2} avg={:.2}",
-                basket_side, basket_idx, fill.qty, fill.price, avg_price
+                "ENTRY {:?} basket#{} qty={:.4} px={:.2} net={:.4} avg={:.2}",
+                fill.side, basket_idx, fill.qty, fill.price, net_qty, avg_price
             ));
 
             // ── 2. Compute TP price at EXACT fill_price ± tp_spread ─────
-            // Per-fill TP (one TP per entry fill, NOT one TP per basket avg).
+            // Per-fill TP: TP side is OPPOSITE of the entry side. A BUY
+            // entry placed at price X is covered by a SELL TP at
+            // X + tp_spread (closes a long position). A SELL entry at X
+            // is covered by a BUY TP at X − tp_spread (closes a short).
             let tp_spread = h.config.trading.tp_spread;
-            let (tp_side, tp_price) = match basket_side {
-                BasketSide::Long => (Side::Sell, fill.price + tp_spread),
-                BasketSide::Short => (Side::Buy, fill.price - tp_spread),
+            let (tp_side, tp_price) = match fill.side {
+                Side::Buy => (Side::Sell, fill.price + tp_spread),
+                Side::Sell => (Side::Buy, fill.price - tp_spread),
             };
 
             // Skip if the TP would be a taker right now (price on wrong side).
@@ -871,10 +862,10 @@ async fn process_fill(h: &EngineHandle, fill: Fill) {
         }
         OrderPurpose::TakeProfit => {
             if let Some(mut b) = h.basket_mgr.baskets.get_mut(&fill.basket_id) {
-                b.apply_tp_fill(fill.qty, fill.price);
+                b.apply_tp_fill(fill.qty, fill.price, fill.side);
                 h.log_line(format!(
-                    "TP filled basket#{} qty={:.4} px={:.2} realized={:.2}",
-                    b.index, fill.qty, fill.price, b.realized_pnl
+                    "TP filled basket#{} {:?}@{:.2} qty={:.4} net={:.4} realized={:.2}",
+                    b.index, fill.side, fill.price, fill.qty, b.net_qty, b.realized_pnl
                 ));
             }
         }
@@ -906,7 +897,7 @@ async fn check_basket_boundaries(h: &EngineHandle) {
 
     // Snapshot the baskets whose SL has fired. Doing this in a separate
     // pass avoids holding DashMap guards across the await for slicing.
-    let breached: Vec<(uuid::Uuid, BasketSide, f64, u32, f64, f64, f64)> = h
+    let breached: Vec<(uuid::Uuid, f64, u32, f64, f64, f64)> = h
         .basket_mgr
         .baskets
         .iter()
@@ -915,8 +906,7 @@ async fn check_basket_boundaries(h: &EngineHandle) {
             if b.sl_breached(mid) {
                 Some((
                     b.basket_id,
-                    b.side,
-                    b.open_qty,
+                    b.net_qty,
                     b.index,
                     b.anchor_price,
                     b.upper_sl,
@@ -932,11 +922,11 @@ async fn check_basket_boundaries(h: &EngineHandle) {
         return;
     }
 
-    for (bid, basket_side, qty, idx, anchor, upper, lower) in breached {
+    for (bid, net_qty, idx, anchor, upper, lower) in breached {
         let which_bound = if mid >= upper { "UPPER" } else { "LOWER" };
         h.log_line(format!(
-            "BASKET SL — basket#{} {} bound hit (mid={:.2}, anchor={:.2}, range=[{:.2}, {:.2}])",
-            idx, which_bound, mid, anchor, lower, upper
+            "BASKET SL — basket#{} {} bound hit (mid={:.2}, anchor={:.2}, range=[{:.2}, {:.2}], net={:.4})",
+            idx, which_bound, mid, anchor, lower, upper, net_qty
         ));
 
         // Cancel any resting orders that belong to THIS basket so they
@@ -953,34 +943,35 @@ async fn check_basket_boundaries(h: &EngineHandle) {
             let _ = h.exchange.cancel(oid).await;
         }
 
-        // Flatten via emergency slicing.
-        let close_side = match basket_side {
-            BasketSide::Long => Side::Sell,
-            BasketSide::Short => Side::Buy,
-        };
-        let exit_px = match h
-            .slicing
-            .flatten(bid, close_side, qty, OrderPurpose::StopLossExit)
-            .await
-        {
-            Ok(px) => {
-                h.log_line(format!(
-                    "  basket#{} flattened @ {:.2} (per-basket SL)",
-                    idx, px
-                ));
-                px
+        // Flatten via emergency slicing. Direction depends on the SIGN
+        // of net_qty: net long → SELL to close; net short → BUY to close.
+        let close_side = if net_qty > 0.0 { Side::Sell } else { Side::Buy };
+        let abs_qty = net_qty.abs();
+        let exit_px = if abs_qty > 1e-9 {
+            match h
+                .slicing
+                .flatten(bid, close_side, abs_qty, OrderPurpose::StopLossExit)
+                .await
+            {
+                Ok(px) => {
+                    h.log_line(format!(
+                        "  basket#{} flattened {:?} {:.4} @ {:.2}",
+                        idx, close_side, abs_qty, px
+                    ));
+                    px
+                }
+                Err(e) => {
+                    h.log_line(format!(
+                        "  CRITICAL: basket#{} flatten FAILED ({}). Marking KILLED anyway — verify exchange manually.",
+                        idx, e
+                    ));
+                    mid
+                }
             }
-            Err(e) => {
-                h.log_line(format!(
-                    "  CRITICAL: basket#{} flatten FAILED ({}). Marking KILLED anyway — verify exchange manually.",
-                    idx, e
-                ));
-                mid
-            }
+        } else {
+            mid
         };
 
-        // Permanently KILL this basket — NO soft-reset. The user's rule:
-        // once a basket's SL fires, that basket is done for the session.
         if let Some(mut b) = h.basket_mgr.baskets.get_mut(&bid) {
             b.kill(exit_px);
         }
@@ -988,6 +979,16 @@ async fn check_basket_boundaries(h: &EngineHandle) {
         // gone, so the saved closing orders would re-open positions if
         // they ever un-parked.
         h.parked_tps.write().retain(|p| p.basket_id != bid);
+
+        // Promote the next IDLE basket so subsequent fills route there.
+        let next = h.basket_mgr.activate_next_idle();
+        if let Some(nid) = next {
+            if let Some(nb) = h.basket_mgr.baskets.get(&nid) {
+                h.log_line(format!("  basket#{} promoted to ACTIVE", nb.index));
+            }
+        } else {
+            h.log_line("  no more baskets available — bot will stop".to_string());
+        }
 
         // basket_hits counter = number of permanently-killed baskets.
         let prev = h.basket_hits.fetch_add(1, Ordering::Relaxed);
@@ -1002,23 +1003,12 @@ async fn check_basket_boundaries(h: &EngineHandle) {
         ));
     }
 
-    // Post-flatten residual mop-up: same logic as before — ensure the
-    // exchange position is actually zero after slicing, otherwise place
-    // one reduce-only market against whatever's left.
+    // Post-flatten residual mop-up: ensure the exchange position is
+    // actually zero after slicing, otherwise place one reduce-only
+    // market against whatever's left. Bot net is now signed net_qty.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     let xpos = h.exchange.position().await;
-    let bot_net: f64 = h
-        .basket_mgr
-        .baskets
-        .iter()
-        .map(|e| {
-            let b = e.value();
-            match b.side {
-                BasketSide::Long => b.open_qty,
-                BasketSide::Short => -b.open_qty,
-            }
-        })
-        .sum();
+    let bot_net: f64 = h.basket_mgr.baskets.iter().map(|e| e.value().net_qty).sum();
     let residual = xpos - bot_net;
     if residual.abs() > 0.5 {
         h.log_line(format!(
@@ -1173,14 +1163,14 @@ async fn check_cycle_boundary(h: &EngineHandle) {
     let _ = h.exchange.cancel_all().await;
 
     // 2. Flatten every basket that has open qty, via slicing (reduce-only market).
-    let to_flatten: Vec<(uuid::Uuid, BasketSide, f64, u32)> = h
+    let to_flatten: Vec<(uuid::Uuid, f64, u32)> = h
         .basket_mgr
         .baskets
         .iter()
         .filter_map(|e| {
             let b = e.value();
-            if b.open_qty > 0.0 {
-                Some((b.basket_id, b.side, b.open_qty, b.index))
+            if b.net_qty.abs() > 1e-9 {
+                Some((b.basket_id, b.net_qty, b.index))
             } else {
                 None
             }
@@ -1189,14 +1179,10 @@ async fn check_cycle_boundary(h: &EngineHandle) {
     // Flatten every basket. We always soft-reset bookkeeping AND increment the
     // hits counter — partial flatten failures are logged loudly but do NOT
     // trip the kill switch by themselves. Only the max_basket_hits cap does.
-    // (Previously a single Err from slicing.flatten skipped the increment and
-    // killed the bot, which caused "hits=1 but 3 baskets KILLED" reports.)
     let mut any_failed = false;
-    for (bid, basket_side, qty, idx) in to_flatten {
-        let close_side = match basket_side {
-            BasketSide::Long => Side::Sell,  // long → sell to close
-            BasketSide::Short => Side::Buy,  // short → buy to close
-        };
+    for (bid, net_qty, idx) in to_flatten {
+        let close_side = if net_qty > 0.0 { Side::Sell } else { Side::Buy };
+        let qty = net_qty.abs();
         let result = h
             .slicing
             .flatten(bid, close_side, qty, OrderPurpose::StopLossExit)

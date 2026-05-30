@@ -510,6 +510,14 @@ function AgentItem({
           last active {formatRelativeAgo(a.last_active_at)}
         </div>
       )}
+      {!isActive && a.last_stop_reason && a.last_stop_reason.length > 0 && (
+        <div
+          className="mt-1 text-[10px] px-1.5 py-0.5 rounded bg-rose-50 border border-rose-200 text-rose-700"
+          title={a.last_stop_reason}
+        >
+          ⚠ {a.last_stop_reason}
+        </div>
+      )}
       {!isActive && (
         <div className="flex justify-end gap-1 mt-2">
           <button

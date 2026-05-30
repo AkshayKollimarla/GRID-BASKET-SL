@@ -102,6 +102,14 @@ pub struct AgentConfig {
     /// so the most-recently-used config appears first. 0 = never run.
     #[serde(default)]
     pub last_active_at: i64,
+    /// Human-readable reason for the most recent stop. Set by the
+    /// action endpoints (Stop/Kill/Force-Flatten) and by the engine
+    /// main loop when it self-stops on all_killed. Empty when the
+    /// agent has never run or is currently running. Surfaced on the
+    /// Inactive sidebar card so the operator can see why each bot
+    /// shut down at a glance.
+    #[serde(default)]
+    pub last_stop_reason: String,
     pub trading: TradingConfig,
     pub basket: BasketConfig,
     pub kill_switch: KillSwitchConfig,
@@ -117,6 +125,7 @@ impl AgentConfig {
         Self {
             name: "Demo Agent".into(),
             last_active_at: 0,
+            last_stop_reason: String::new(),
             trading: TradingConfig {
                 token: "BTC-USDT".into(),
                 exchange: Exchange::Mock,

@@ -703,6 +703,24 @@ pub fn spawn_engine(handle: Arc<EngineHandle>, mut fills_rx: broadcast::Receiver
                         book.mid - dist,
                         book.mid + dist
                     ));
+                    // Anchor the FIRST basket at startup mid so its SL
+                    // range is defined immediately. Without this, the
+                    // first basket sits IDLE with anchor=0 until its
+                    // first fill arrives — which may be at a price
+                    // already drifted from the operator's "start price".
+                    if let Some(first_id) = h.basket_mgr.activate_next_idle() {
+                        if let Some(mut nb) = h.basket_mgr.baskets.get_mut(&first_id) {
+                            nb.set_sl_anchor(book.mid, dist);
+                            let nidx = nb.index;
+                            let nupper = nb.upper_sl;
+                            let nlower = nb.lower_sl;
+                            drop(nb);
+                            h.log_line(format!(
+                                "  basket#{} anchored @ {:.2} → SL range [{:.2}, {:.2}]",
+                                nidx, book.mid, nlower, nupper
+                            ));
+                        }
+                    }
                 }
             }
 
@@ -1140,11 +1158,27 @@ async fn check_basket_boundaries(h: &EngineHandle) {
         // they ever un-parked.
         h.parked_tps.write().retain(|p| p.basket_id != bid);
 
-        // Promote the next IDLE basket so subsequent fills route there.
+        // Promote the next IDLE basket AND immediately anchor it at
+        // current mid so its SL range is defined from THIS moment, not
+        // when its first fill happens to arrive. The user's spec:
+        // "if the basket hit, the trading should start from the live
+        //  anchor price till the basket count hit." Without this the
+        // new basket would sit IDLE with anchor=0 until its first
+        // entry filled — which might be some time later at a price
+        // that's already drifted from the SL trigger point.
         let next = h.basket_mgr.activate_next_idle();
         if let Some(nid) = next {
-            if let Some(nb) = h.basket_mgr.baskets.get(&nid) {
-                h.log_line(format!("  basket#{} promoted to ACTIVE", nb.index));
+            let distance = h.config.trading.grid_distance.max(0.0);
+            if let Some(mut nb) = h.basket_mgr.baskets.get_mut(&nid) {
+                nb.set_sl_anchor(mid, distance);
+                let nidx = nb.index;
+                let nupper = nb.upper_sl;
+                let nlower = nb.lower_sl;
+                drop(nb);
+                h.log_line(format!(
+                    "  basket#{} promoted to ACTIVE @ {:.2} → SL range [{:.2}, {:.2}]",
+                    nidx, mid, nlower, nupper
+                ));
             }
         } else {
             h.log_line("  no more baskets available — bot will stop".to_string());

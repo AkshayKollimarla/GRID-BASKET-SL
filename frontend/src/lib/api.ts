@@ -6,6 +6,10 @@ export type AgentConfig = {
   /** Epoch ms — set every time the agent is started. UI sorts the
    *  Inactive sidebar list by this descending (most recent first). */
   last_active_at?: number;
+  /** Why the agent stopped: "Stopped by user", "Killed by user",
+   *  "All baskets killed", etc. Empty while the agent is running or
+   *  has never run. Shown on inactive sidebar cards. */
+  last_stop_reason?: string;
   trading: {
     token: string;
     exchange: "binance" | "deribit" | "hyperliquid" | "mock";

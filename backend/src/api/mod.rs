@@ -177,9 +177,11 @@ async fn start(
     }
     // Persist the config (insert or update) so the sidebar shows it.
     // Stamp `last_active_at` so the UI can sort Inactive by recency.
+    // Clear any previous stop reason — the bot is being started fresh.
     let mut to_save = cfg.clone();
     to_save.name = name.clone();
     to_save.last_active_at = chrono::Utc::now().timestamp_millis();
+    to_save.last_stop_reason = String::new();
     upsert_saved(&state, to_save.clone());
 
     match EngineHandle::new(to_save).await {
@@ -213,6 +215,19 @@ fn upsert_saved(state: &AppState, cfg: AgentConfig) {
     state.persist();
 }
 
+/// Update only the `last_stop_reason` field of a saved agent and
+/// persist. No-op if the name isn't found (deleted agent).
+fn set_stop_reason(state: &AppState, name: &str, reason: impl Into<String>) {
+    let reason = reason.into();
+    {
+        let mut g = state.saved_agents.write();
+        if let Some(slot) = g.iter_mut().find(|c| c.name == name) {
+            slot.last_stop_reason = reason;
+        }
+    }
+    state.persist();
+}
+
 async fn stop(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -224,6 +239,7 @@ async fn stop(
     }
     // Remove the entry — caller can re-start by POSTing /api/start.
     state.engines.remove(&name);
+    set_stop_reason(&state, &name, "Stopped by user");
     Json(json!({ "status": "stopped", "name": name }))
 }
 
@@ -246,6 +262,7 @@ async fn kill(
             .trip(format!("manual kill from UI for '{}'", name))
             .await;
     }
+    set_stop_reason(&state, &name, "Killed by user");
     Json(json!({ "status": "kill_switch_tripped", "name": name }))
 }
 
@@ -263,10 +280,11 @@ async fn reset(
 /// the UI which ones are currently RUNNING by name so it can group them
 /// under "Active" vs "Inactive" sections.
 async fn list_agents(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let agents = state.saved_agents.read().clone();
-    // Garbage-collect any engine whose `running` is now false, then
-    // gather the names of the survivors.
-    let stale: Vec<String> = state
+    // Garbage-collect any engine whose `running` is now false. For each
+    // self-stopped engine, capture its kill_switch reason (set by
+    // all_killed self-trip or risk-engine trip) and write it to the
+    // saved agent so the Inactive sidebar can display it.
+    let stale: Vec<(String, Option<String>)> = state
         .engines
         .iter()
         .filter_map(|e| {
@@ -275,15 +293,31 @@ async fn list_agents(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                 .running
                 .load(std::sync::atomic::Ordering::Relaxed)
             {
-                Some(e.key().clone())
+                let reason = e.value().kill_switch.reason();
+                Some((e.key().clone(), reason))
             } else {
                 None
             }
         })
         .collect();
-    for name in stale {
+    for (name, reason) in stale {
         state.engines.remove(&name);
+        if let Some(r) = reason {
+            // Only overwrite if the saved entry doesn't already have a
+            // more specific reason set by an action endpoint.
+            let need_set = {
+                let g = state.saved_agents.read();
+                g.iter()
+                    .find(|c| c.name == name)
+                    .map(|c| c.last_stop_reason.is_empty())
+                    .unwrap_or(false)
+            };
+            if need_set {
+                set_stop_reason(&state, &name, r);
+            }
+        }
     }
+    let agents = state.saved_agents.read().clone();
     let active: Vec<String> = state.engines.iter().map(|e| e.key().clone()).collect();
     (
         StatusCode::OK,
@@ -676,6 +710,13 @@ async fn force_flatten(
     match state.live_engine(&name) {
         Some(eng) => {
             let (ok, msg) = eng.force_flatten().await;
+            // Force Flatten doesn't trip the kill switch (it leaves the
+            // bot running so the operator can keep trading after the
+            // mop-up). But if it ran, we still want to surface the
+            // "force flattened" reason if the operator subsequently
+            // stops the bot — append to a pending field via the
+            // existing stop_reason slot.
+            set_stop_reason(&state, &name, format!("Force flatten: {}", msg));
             (
                 StatusCode::OK,
                 Json(json!({ "ok": ok, "message": msg, "name": name })),

@@ -233,11 +233,14 @@ async fn stop(
     Path(name): Path<String>,
 ) -> impl IntoResponse {
     if let Some(eng) = state.live_engine(&name) {
+        eng.log_line(format!("Engine '{}' stopped by user.", name));
+        // Freeze the FINAL state to disk BEFORE flipping `running` so
+        // the snapshot captures the bot mid-trade with every basket /
+        // order / fill / stat intact.
+        eng.save_final_snapshot().await;
         eng.running
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        eng.log_line(format!("Engine '{}' stopped by user.", name));
     }
-    // Remove the entry — caller can re-start by POSTing /api/start.
     state.engines.remove(&name);
     set_stop_reason(&state, &name, "Stopped by user");
     Json(json!({ "status": "stopped", "name": name }))
@@ -247,9 +250,34 @@ async fn snapshot(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    match state.live_engine(&name) {
-        Some(eng) => Json(json!(eng.snapshot().await)).into_response(),
-        None => Json(json!({ "running": false, "message": format!("agent '{}' is not running", name) })).into_response(),
+    if let Some(eng) = state.live_engine(&name) {
+        return Json(json!(eng.snapshot().await)).into_response();
+    }
+    // No live engine — try to serve the FROZEN snapshot saved when
+    // the bot last stopped, so the operator can still review the
+    // post-mortem state in the UI.
+    let path = EngineHandle::snapshot_file_path(&name);
+    match tokio::fs::read_to_string(&path).await {
+        Ok(s) => match serde_json::from_str::<serde_json::Value>(&s) {
+            Ok(mut v) => {
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("frozen".into(), serde_json::json!(true));
+                    // `running` should already be false in the saved
+                    // snapshot, but force it just in case the file was
+                    // written while the engine was still alive.
+                    obj.insert("running".into(), serde_json::json!(false));
+                }
+                Json(v).into_response()
+            }
+            Err(_) => Json(
+                json!({ "running": false, "frozen": false, "message": format!("agent '{}' snapshot file is corrupt", name) }),
+            )
+            .into_response(),
+        },
+        Err(_) => Json(
+            json!({ "running": false, "frozen": false, "message": format!("agent '{}' is not running and has no frozen snapshot", name) }),
+        )
+        .into_response(),
     }
 }
 
@@ -261,6 +289,9 @@ async fn kill(
         eng.kill_switch
             .trip(format!("manual kill from UI for '{}'", name))
             .await;
+        // Freeze the post-kill state so the inactive view shows what
+        // happened (basket statuses, last open orders, realized PnL).
+        eng.save_final_snapshot().await;
     }
     set_stop_reason(&state, &name, "Killed by user");
     Json(json!({ "status": "kill_switch_tripped", "name": name }))
@@ -300,6 +331,14 @@ async fn list_agents(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             }
         })
         .collect();
+    // For each engine we're about to garbage-collect, freeze its
+    // final snapshot to disk first — main loop self-stop didn't
+    // necessarily do so itself.
+    for (name, _) in &stale {
+        if let Some(eng) = state.engines.get(name) {
+            eng.value().save_final_snapshot().await;
+        }
+    }
     for (name, reason) in stale {
         state.engines.remove(&name);
         if let Some(r) = reason {
@@ -710,12 +749,10 @@ async fn force_flatten(
     match state.live_engine(&name) {
         Some(eng) => {
             let (ok, msg) = eng.force_flatten().await;
-            // Force Flatten doesn't trip the kill switch (it leaves the
-            // bot running so the operator can keep trading after the
-            // mop-up). But if it ran, we still want to surface the
-            // "force flattened" reason if the operator subsequently
-            // stops the bot — append to a pending field via the
-            // existing stop_reason slot.
+            // Snapshot the post-flatten state so even if the operator
+            // later stops the bot without further events, the frozen
+            // view shows the flat exchange + cleared baskets.
+            eng.save_final_snapshot().await;
             set_stop_reason(&state, &name, format!("Force flatten: {}", msg));
             (
                 StatusCode::OK,

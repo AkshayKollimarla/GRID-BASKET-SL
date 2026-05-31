@@ -61,6 +61,13 @@ pub struct EngineSnapshot {
     /// full on their side. They will be re-placed when mid drifts back
     /// near their price AND a slot is free.
     pub parked_tp_count: usize,
+    /// True when this snapshot was read from disk (the bot stopped
+    /// and we're showing the frozen state). False = live snapshot
+    /// from a running engine. The UI uses this to render a "FROZEN"
+    /// badge so the operator can tell at a glance whether the data
+    /// is live or post-mortem.
+    #[serde(default)]
+    pub frozen: bool,
 }
 
 /// One persisted history event — appended to `history/<agent>.jsonl`
@@ -459,7 +466,7 @@ impl EngineHandle {
     /// Sanitize an agent name for use as a filename. Whitespace becomes
     /// '_', and only ASCII alphanumerics + a few safe punctuation
     /// characters survive. Empty result falls back to "agent".
-    fn history_filename(name: &str) -> String {
+    pub fn history_filename(name: &str) -> String {
         let mut s = String::new();
         for ch in name.chars() {
             if ch.is_ascii_alphanumeric() {
@@ -609,7 +616,42 @@ impl EngineHandle {
             bot_net_qty,
             position_drift,
             parked_tp_count,
+            frozen: false,
         }
+    }
+
+    /// Persist the current snapshot to `snapshots/<sanitized>.json` so
+    /// it can be reviewed after the bot stops. Called from the action
+    /// endpoints (stop, kill, force_flatten) and from the GC in
+    /// `list_agents` right before a stale engine is removed, and from
+    /// the main tick loop when the engine self-stops via all_killed.
+    /// Best-effort: I/O errors logged at WARN and the engine keeps
+    /// going.
+    pub async fn save_final_snapshot(&self) {
+        let snap = self.snapshot().await;
+        let _ = tokio::fs::create_dir_all("snapshots").await;
+        let base = Self::history_filename(&self.config.name);
+        // history_filename returns "<sanitized>.jsonl"; swap to .json.
+        let fname = base.trim_end_matches(".jsonl");
+        let path = format!("snapshots/{}.json", fname);
+        match serde_json::to_string_pretty(&snap) {
+            Ok(s) => {
+                if let Err(e) = tokio::fs::write(&path, s).await {
+                    tracing::warn!(?e, ?path, "save_final_snapshot write failed");
+                } else {
+                    tracing::info!(?path, "final snapshot frozen to disk");
+                }
+            }
+            Err(e) => tracing::warn!(?e, "serialize snapshot failed"),
+        }
+    }
+
+    /// Path to where the frozen snapshot for `agent_name` would live.
+    /// Used by the API layer to read back when no live engine exists.
+    pub fn snapshot_file_path(agent_name: &str) -> String {
+        let base = Self::history_filename(agent_name);
+        let fname = base.trim_end_matches(".jsonl");
+        format!("snapshots/{}.json", fname)
     }
 }
 
@@ -814,6 +856,9 @@ pub fn spawn_engine(handle: Arc<EngineHandle>, mut fills_rx: broadcast::Receiver
                         .await;
                 }
                 h.log_line("All baskets killed — bot stopped.".to_string());
+                // Freeze the FINAL state to disk before exiting the
+                // loop so the operator can review it from the sidebar.
+                h.save_final_snapshot().await;
                 h.running.store(false, Ordering::Relaxed);
                 break;
             }

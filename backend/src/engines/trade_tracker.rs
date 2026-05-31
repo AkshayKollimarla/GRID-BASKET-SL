@@ -10,7 +10,7 @@
 use crate::engines::basket_manager::BasketManager;
 use crate::models::{Fill, OrderPurpose, RoundTrip, Side, TradeStats};
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -49,9 +49,15 @@ struct State {
     sell_notional: f64,
     buy_qty: f64,
     sell_qty: f64,
-    total_fills: u64,
-    total_buys: u64,
-    total_sells: u64,
+    /// Sets of unique exchange order_ids that have produced fills, by
+    /// side. A single Deribit order that fills in 12 partial chunks
+    /// counts as ONE entry here — the UI's "TOTAL BUYS / SELLS / FILLS"
+    /// KPIs are the cardinalities of these sets, not the raw partial
+    /// count. (Previously each partial bumped the counter and the user
+    /// saw `TOTAL BUYS = 13` for what was really 2 logical orders.)
+    buy_orders: HashSet<Uuid>,
+    sell_orders: HashSet<Uuid>,
+    all_orders: HashSet<Uuid>,
 }
 
 pub struct TradeTracker {
@@ -92,9 +98,9 @@ impl TradeTracker {
                 sell_notional: 0.0,
                 buy_qty: 0.0,
                 sell_qty: 0.0,
-                total_fills: 0,
-                total_buys: 0,
-                total_sells: 0,
+                buy_orders: HashSet::new(),
+                sell_orders: HashSet::new(),
+                all_orders: HashSet::new(),
             }),
         }
     }
@@ -104,7 +110,11 @@ impl TradeTracker {
     /// the 24h summary can include round trips even after the bot stops.
     pub fn ingest(&self, fill: &Fill) -> Vec<RoundTrip> {
         let mut s = self.state.lock();
-        s.total_fills += 1;
+        // Record this order_id in the side-specific + global set. The
+        // KPI counters (total_buys / total_sells / total_fills) come
+        // from these set cardinalities at `stats()` time, so partial
+        // fills of the same order increment them ONCE.
+        s.all_orders.insert(fill.order_id);
         s.total_fees += fill.fee.max(0.0);
 
         let fee_per_unit = if fill.qty > 0.0 {
@@ -126,16 +136,18 @@ impl TradeTracker {
         // so VWAP works for both inverse (qty in USD) and linear (qty in BTC).
         let price_qty = fill.price * fill.qty;
 
-        // Side-agnostic counters.
+        // Per-side accumulators — qty/volume/notional add EVERY partial
+        // (those values are real units traded), only the counters are
+        // deduped to one-per-order via the HashSets.
         match fill.side {
             Side::Buy => {
-                s.total_buys += 1;
+                s.buy_orders.insert(fill.order_id);
                 s.buy_qty += fill.qty;
                 s.buy_volume += notional_usd;
                 s.buy_notional += price_qty;
             }
             Side::Sell => {
-                s.total_sells += 1;
+                s.sell_orders.insert(fill.order_id);
                 s.sell_qty += fill.qty;
                 s.sell_volume += notional_usd;
                 s.sell_notional += price_qty;
@@ -321,9 +333,11 @@ impl TradeTracker {
             buy_qty: s.buy_qty,
             sell_qty: s.sell_qty,
             net_qty: s.buy_qty - s.sell_qty,
-            total_fills: s.total_fills,
-            total_buys: s.total_buys,
-            total_sells: s.total_sells,
+            // KPI counters are CARDINALITIES of the unique-order_id sets.
+            // 12 partial fills of one order → 1 in total_fills/total_buys.
+            total_fills: s.all_orders.len() as u64,
+            total_buys: s.buy_orders.len() as u64,
+            total_sells: s.sell_orders.len() as u64,
         }
     }
 

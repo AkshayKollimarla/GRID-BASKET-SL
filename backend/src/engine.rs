@@ -282,7 +282,11 @@ impl EngineHandle {
             basket_mgr.clone(),
             exchange_dyn.clone(),
         ));
-        let risk = Arc::new(RiskEngine::new(config.clone(), basket_mgr.clone()));
+        let risk = Arc::new(RiskEngine::new(
+            config.clone(),
+            basket_mgr.clone(),
+            is_inverse,
+        ));
         let slicing = Arc::new(SlicingEngine::new(
             config.slicing.clone(),
             exchange_dyn.clone(),
@@ -569,7 +573,8 @@ impl EngineHandle {
         // Do all awaits BEFORE taking any parking_lot guards.
         let open_orders = self.exchange.open_orders().await;
         let exchange_name = self.exchange.name().await.to_string();
-        let risk = self.risk.assess();
+        let mid_for_risk = *self.mid_price.read();
+        let risk = self.risk.assess(mid_for_risk);
         let now_ms = chrono::Utc::now().timestamp_millis();
         let trade_stats = self.trade_tracker.stats(now_ms);
         let round_trips = self.trade_tracker.recent_round_trips(200);
@@ -767,7 +772,7 @@ pub fn spawn_engine(handle: Arc<EngineHandle>, mut fills_rx: broadcast::Receiver
             }
 
             // 3. Risk engine assessment.
-            let risk = h.risk.assess();
+            let risk = h.risk.assess(*h.mid_price.read());
             if !risk.healthy() && !h.kill_switch.is_tripped() {
                 let reason = risk.breach_reason.clone().unwrap_or("unknown".into());
                 h.log_line(format!("Risk breach: {} — tripping kill switch", reason));

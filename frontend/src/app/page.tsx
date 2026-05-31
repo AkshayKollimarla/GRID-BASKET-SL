@@ -1131,11 +1131,24 @@ function ConfigPanel({
       </Section>
 
       <Section title="Baskets">
+        <div className="text-[11px] mb-2 px-2 py-1 rounded border bg-amber-50 border-amber-300 text-amber-800">
+          <strong># Baskets</strong> = max number of basket KILLS before the
+          bot stops. Each basket gets its own SL range
+          (anchor ± grid_distance). When one is killed, the next is
+          activated at live mid. Set this to your desired cascade depth
+          (e.g., 4 for the cascade you described).
+        </div>
         <div className="grid grid-cols-2 gap-3">
-          <Field label="# Baskets">
+          <Field label="# Baskets (cascade depth)">
             <NumInput
               v={cfg.basket.num_baskets}
-              on={(v) => update("basket", "num_baskets", Math.round(v))}
+              on={(v) =>
+                update(
+                  "basket",
+                  "num_baskets",
+                  Math.max(1, Math.round(v))
+                )
+              }
             />
           </Field>
           <Field label="Basket size">
@@ -1154,8 +1167,46 @@ function ConfigPanel({
 
       <Section title="Kill Switch">
         <KillSwitchSanityWarning cfg={cfg} setCfg={setCfg} />
+        {(() => {
+          const coins = cfg.kill_switch.max_position_cap_coins ?? 0;
+          const usingCoins = coins > 0;
+          return (
+            <div className="text-[11px] mb-2 px-2 py-1 rounded border bg-blue-50 border-blue-200 text-blue-700">
+              {usingCoins ? (
+                <>
+                  Using <strong>COIN cap</strong> ({coins.toFixed(4)} coins ×
+                  live mid). The qty-units field below is ignored.
+                </>
+              ) : (
+                <>
+                  COIN cap is 0 → falling back to the <strong>qty-units</strong>{" "}
+                  field below. Set the COIN cap to use coin-based capping
+                  (recommended for inverse contracts like Deribit).
+                </>
+              )}
+            </div>
+          );
+        })()}
         <div className="grid grid-cols-2 gap-3">
-          <Field label="Max position cap">
+          <Field label="Max position cap (COINS — preferred)">
+            <NumInput
+              v={cfg.kill_switch.max_position_cap_coins ?? 0}
+              on={(v) =>
+                update(
+                  "kill_switch",
+                  "max_position_cap_coins",
+                  Math.max(0, v)
+                )
+              }
+            />
+          </Field>
+          <Field
+            label={
+              (cfg.kill_switch.max_position_cap_coins ?? 0) > 0
+                ? "Max position cap (qty units — IGNORED, coins active)"
+                : "Max position cap (qty units — legacy)"
+            }
+          >
             <NumInput
               v={cfg.kill_switch.max_position_cap}
               on={(v) => update("kill_switch", "max_position_cap", v)}
@@ -1167,7 +1218,7 @@ function ConfigPanel({
               on={(v) => update("kill_switch", "max_daily_loss", v)}
             />
           </Field>
-          <Field label="Max basket hits (cycle resets)">
+          <Field label="Max basket hits (LEGACY — ignored, see Num baskets)">
             <NumInput
               v={cfg.kill_switch.max_basket_hits}
               on={(v) =>

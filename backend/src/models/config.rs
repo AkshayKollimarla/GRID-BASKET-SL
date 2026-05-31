@@ -64,7 +64,18 @@ impl BasketConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KillSwitchConfig {
+    /// LEGACY — exposure cap in raw qty units. For Deribit INVERSE that
+    /// means USD (qty = USD notional); for linear exchanges it's the
+    /// base coin. Used as the fallback when `max_position_cap_coins` is
+    /// 0. Leave at a large value when you set the coin-based cap.
     pub max_position_cap: f64,
+    /// PRIMARY — exposure cap expressed in BASE COIN units (e.g. ETH,
+    /// BTC). When > 0 this overrides `max_position_cap`: effective cap
+    /// each tick is `coins × live_mid` (inverse) or `coins` (linear).
+    /// This is what the operator typically wants to set, because the
+    /// number is meaningful regardless of price.
+    #[serde(default)]
+    pub max_position_cap_coins: f64,
     pub max_daily_loss: f64,
     pub api_disconnect_protection: bool,
     /// Max number of soft boundary-SL cycle resets allowed before the bot
@@ -145,6 +156,7 @@ impl AgentConfig {
             },
             kill_switch: KillSwitchConfig {
                 max_position_cap: 0.5,
+                max_position_cap_coins: 0.0,
                 max_daily_loss: 500.0,
                 api_disconnect_protection: true,
                 max_basket_hits: 5,

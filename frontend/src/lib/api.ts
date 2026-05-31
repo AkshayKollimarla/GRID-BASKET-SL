@@ -31,7 +31,12 @@ export type AgentConfig = {
     basket_sl_distance?: number;
   };
   kill_switch: {
+    /** Legacy qty-units cap (USD for Deribit inverse). Fallback when
+     *  `max_position_cap_coins` is 0. */
     max_position_cap: number;
+    /** Preferred cap in BASE COIN units (e.g. ETH). When > 0, backend
+     *  uses `coins × mid` (inverse) or `coins` (linear). */
+    max_position_cap_coins?: number;
     max_daily_loss: number;
     api_disconnect_protection: boolean;
     max_basket_hits: number;

@@ -178,6 +178,11 @@ export type Snapshot = {
   /** TPs currently parked off-exchange (depth budget was full when they
    *  were placed). They auto-return when mid drifts back into range. */
   parked_tp_count: number;
+  /** True when the snapshot was read from disk (the bot stopped and
+   *  we're showing its final saved state). False = live snapshot
+   *  from a running engine. The UI shows a "FROZEN" badge so the
+   *  operator can tell at a glance. */
+  frozen?: boolean;
 };
 
 export async function getDefaultConfig(): Promise<AgentConfig> {
@@ -463,8 +468,10 @@ export async function getInstruments(
   }
 }
 
-/** Fetch the snapshot for the named running agent. Returns null if
- *  the agent isn't running (backend returns `{running: false}`). */
+/** Fetch the snapshot for the named running agent — OR the frozen
+ *  snapshot from disk if the agent has stopped. Returns null only
+ *  when both are missing (agent doesn't exist on the backend AND has
+ *  no saved snapshot). */
 export async function getSnapshot(name: string): Promise<Snapshot | null> {
   if (!name) return null;
   try {
@@ -473,7 +480,10 @@ export async function getSnapshot(name: string): Promise<Snapshot | null> {
       { cache: "no-store" }
     );
     const j = await r.json();
-    if (j.running === false && !j.baskets) return null;
+    // The backend returns a frozen snapshot (with baskets etc.) when
+    // the bot is stopped; only treat the response as "no snapshot"
+    // when it's truly the not-running-no-snapshot stub.
+    if (!j.baskets) return null;
     return j;
   } catch {
     return null;

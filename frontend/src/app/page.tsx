@@ -54,21 +54,29 @@ export default function Home() {
       );
   }, []);
 
-  // Snapshot polling targets the CURRENTLY SELECTED agent. If the user
-  // hasn't selected one yet (cfg null) or the selected one isn't running,
-  // we still call getSnapshot — it returns null and the UI shows empty.
+  // Snapshot polling targets the CURRENTLY SELECTED agent. Polls fast
+  // (250 ms) for a live engine; once the response comes back marked
+  // `frozen: true`, switch to slow polling (5 s) since the disk file
+  // doesn't change tick-to-tick.
   useEffect(() => {
     const name = cfg?.name;
     if (!name) {
       setSnap(null);
       return;
     }
-    const t = setInterval(async () => {
+    let cancelled = false;
+    const fetchOnce = async () => {
       const s = await getSnapshot(name);
-      setSnap(s);
-    }, 250);
-    return () => clearInterval(t);
-  }, [cfg?.name]);
+      if (!cancelled) setSnap(s);
+    };
+    fetchOnce();
+    const interval = snap?.frozen ? 5000 : 250;
+    const t = setInterval(fetchOnce, interval);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
+  }, [cfg?.name, snap?.frozen]);
 
   // Poll the saved-agents list separately and less often.
   useEffect(() => {
@@ -150,6 +158,7 @@ export default function Home() {
               snap={snap}
               onSaved={refreshAgents}
             />
+            {snap?.frozen && <FrozenSnapshotBanner cfg={cfg} />}
             <PositionDriftBanner snap={snap} cfg={cfg} />
             <div className="px-6 pb-8 max-w-7xl mx-auto">
               <AccordionStack cfg={cfg} setCfg={setCfg} snap={snap} />
@@ -640,6 +649,30 @@ function TopBar({
             Reset
           </button>
         </div>
+      </div>
+    </div>
+  );
+}
+
+/// Blue banner that appears at the top of an inactive agent's view to
+/// remind the operator the data they're looking at is a FROZEN
+/// post-stop snapshot, not live. Carries the last_stop_reason so
+/// they can see why it stopped without scrolling the sidebar.
+function FrozenSnapshotBanner({ cfg }: { cfg: AgentConfig }) {
+  const reason = cfg.last_stop_reason || "Stopped";
+  return (
+    <div className="bg-blue-50 border-y border-blue-300 px-6 py-2 text-sm">
+      <div className="flex items-center gap-3 flex-wrap">
+        <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-blue-600 text-white tracking-wider">
+          FROZEN
+        </span>
+        <span className="text-blue-900">
+          This is the agent's final state from when it stopped. Live
+          data resumes when you Start it.
+        </span>
+        <span className="ml-auto font-mono text-xs text-blue-700">
+          reason: <strong>{reason}</strong>
+        </span>
       </div>
     </div>
   );
